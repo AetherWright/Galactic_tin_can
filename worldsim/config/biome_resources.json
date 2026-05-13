@@ -1,0 +1,7 @@
+{
+  "forest": {"food": [80, 120], "metal": [30, 70], "energy": [40, 80], "uranium": [5, 15]},
+  "desert": {"food": [20, 60], "metal": [60, 100], "energy": [80, 120], "uranium": [20, 40]},
+  "oceanic": {"food": [70, 110], "metal": [40, 80], "energy": [50, 90], "uranium": [10, 20]},
+  "ice": {"food": [10, 40], "metal": [50, 90], "energy": [60, 100], "uranium": [15, 30]},
+  "volcanic": {"food": [10, 30], "metal": [80, 120], "energy": [90, 130], "uranium": [30, 60]}
+}

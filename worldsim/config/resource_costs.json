@@ -1,0 +1,15 @@
+{
+  "city": {"food": 20.0, "metal": 10.0},
+  "base": {"metal": 30.0, "energy": 10.0},
+  "mine": {"metal": 15.0, "energy": 5.0},
+  "port": {"metal": 20.0, "energy": 5.0},
+  "factory": {"metal": 40.0, "energy": 20.0},
+  "hospital": {"metal": 10.0, "energy": 5.0},
+  "shipyard": {"metal": 50.0, "energy": 30.0},
+  "school": {"metal": 5.0, "energy": 5.0},
+  "power_plant": {"metal": 30.0},
+  "lab": {"metal": 25.0, "energy": 10.0},
+  "nuke_facility": {"metal": 60.0, "energy": 40.0, "uranium": 20.0},
+  "orbital_defense": {"metal": 80.0, "energy": 50.0},
+  "spaceport": {"metal": 70.0, "energy": 40.0}
+}
