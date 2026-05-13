@@ -1,0 +1,4 @@
+pyinstaller
+nuitka
+numpy>=1.24
+pyyaml
