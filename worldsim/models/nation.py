@@ -60,7 +60,7 @@ from ..planets import (
     OrbitalDefense,
 )
 from .tech import Technology, TechnologyTree, setup_default_tech_tree
-from .war import Division, DivisionTemplate, build_division, manage_divisions
+from .war import Division, DivisionTemplate, build_division
 from .fleet import Fleet, build_fleet_ship, process_fleet_movement, order_fleet_move
 from .military_ai import DoctrineAI, issue_doctrine
 
@@ -371,7 +371,7 @@ class Nation:
         diplomacy_path = self._ai_table_path("diplomacy")
         research_path = self._ai_table_path("research")
         self.military_ai = WarAI(allies_dim=ally_dim, table_path=military_path)
-        self.civilian_ai = DomesticPolicyAI(21,n_inputs=13,hidden_layers=(32, 24, 16, 10, 7, 10, 16, 24, 32),table_path=civilian_path,)
+        self.civilian_ai = DomesticPolicyAI(21,n_inputs=20,hidden_layers=(32, 24, 16, 10, 8, 7, 7, 8, 10, 16, 24, 32),table_path=civilian_path,)
         self.project_ai = ProjectAI(
             len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
         )
@@ -469,7 +469,7 @@ class Nation:
         self.leader = self.leader_model.generate(self)
         self._update_centroids()
     def _fleet_count(self):
-        return len(self.fleets)
+        return float(len(self.fleets))
     def _update_centroids(self) -> None:
         """Recalculate 2-D and 3-D centroids based on owned cities."""
         if not self.cities:
@@ -507,9 +507,7 @@ class Nation:
 
     def step_meta(self, year: int) -> None:
         self.current_year = year
-        for ga in self.reward_ga.values():
-            ga.step()
-        self.leader_model.step()
+        self.leader_model.step(1)
 
     def evolve_meta(self) -> None:
         for ga in self.reward_ga.values():
@@ -720,9 +718,6 @@ class Nation:
             self,
             self.research_ai,
         )
-
-        self.upgrade_assets()
-
         self.produce_nuclear_weapons()
         self.progress_projects()
 
@@ -750,8 +745,6 @@ class Nation:
             self._apply_civilian_ai()
         else:
             self._random_civilian_actions(nations)
-
-        manage_divisions(self, self.doctrine_signal)
         process_fleet_movement(self, nations)   # physics: ticks movement, handles arrivals
         issue_doctrine(self, nations)            # strategy: doctrine + fleet FSM decisions
 
@@ -1249,7 +1242,6 @@ class Nation:
 
     def _civilian_state(self) -> List[float]:
         return [
-            # Internal state
             self.economy,
             self.technology.overall,
             self.military,
@@ -1258,11 +1250,16 @@ class Nation:
             float(len(self.projects)),
             float(self.star_count),
             self._fleet_count(),           
-            # Resource state
+            float(len(self.cities)),
+            float(len(self.divisions)),
+            float(len(self.mines)),
+            float(len(self.factories)),
+            float(len(self.schools)),
+            float(len(self.labs)),
+            float(len(self.hospitals)),
             self.resources.get("metal", 0.0) / 100.0,
             self.resources.get("uranium", 0.0) / 100.0,
             self.resources.get("energy", 0.0) / 100.0,
-            # External context
             float(len(self.at_war)),
             float(len(self.alliances)),
         ]
@@ -1294,7 +1291,7 @@ class Nation:
             actions[idx]()
     def _valid_action_mask(self) -> List[bool]:
         has_nuke_tech = "Nuclear Weapons" in self.tech_tree.unlocked
-        has_shipyard = any(True for _ in self.shipyards) if hasattr(self, 'shipyards') else False
+        has_shipyard = len(self.shipyards) > 0
         has_spaceport = bool(self.spaceports) if hasattr(self, 'spaceports') else False
         can_colonize = self.star_count < len([s for s in STARS.values() if s.owner is None])
         

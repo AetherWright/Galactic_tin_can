@@ -1,11 +1,11 @@
 from __future__ import annotations
-
+import math
 from dataclasses import dataclass, field
 import random
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from ..planets import PLANETS
-from ..utils import distance, vprint, wprint
+from ..utils import distance, vprint, wprint, logistic_growth
 from ..ai import SimplePerceptron
 from ..representations import build_alliance_matrix, galactic_control_layers
 
@@ -19,11 +19,11 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _DOCTRINE_MANPOWER: Dict[str, float] = {
-    "total_war":         0.20,
-    "offensive":         0.10,
-    "defensive":         0.10,
-    "strategic_reserve": 0.06,
-    "economic":          0.05,
+    "total_war":         0.05,   # extreme wartime mobilization
+    "offensive":         0.008,  
+    "defensive":         0.007,
+    "strategic_reserve": 0.015,  # peacetime standing force
+    "economic":          0.002,
 }
 _DEFAULT_MANPOWER: float = 0.08
 
@@ -476,70 +476,12 @@ def build_division(nation: "Nation", template_name: Optional[str] = None) -> Non
         )
     )
 
-
-def manage_divisions(
-    nation: "Nation",
-    doctrine_signal: str = "defensive",
-) -> None:
-    """Ensure ``nation`` maintains a doctrine-appropriate number of divisions.
-
-    The doctrine signal controls the maximum fraction of the national
-    population that may be under arms.  Divisions are added to reach a
-    minimal baseline (at least one of each template type), but the total
-    manpower ceiling is enforced first so aggressive recruitment does not
-    drain cities during peacetime.
-    """
-    # ------------------------------------------------------------------
-    # 1. Enforce doctrine manpower cap
-    # ------------------------------------------------------------------
-    manpower_frac  = _DOCTRINE_MANPOWER.get(doctrine_signal, _DEFAULT_MANPOWER)
-    base_div_size  = 1000   # fallback when no template exists
-    if nation.division_templates:
-        _first = next(iter(nation.division_templates.values()))
-        base_div_size = _first.base_size
-    max_soldiers = max(base_div_size, int(nation.population * manpower_frac))
-
-    total_soldiers = sum(d.soldiers for d in nation.divisions)
-    # Demobilise if over cap: reduce the largest division first
-    while total_soldiers > max_soldiers and nation.divisions:
-        largest = max(nation.divisions, key=lambda d: d.soldiers)
-        excess  = total_soldiers - max_soldiers
-        release = min(largest.soldiers, excess)
-        _deduct_city_population(nation, -release)  # return soldiers to cities
-        # Actually add population back
-        if nation.cities:
-            largest_city = max(nation.cities, key=lambda c: c.population)
-            largest_city.population += release
-        largest.soldiers -= release
-        total_soldiers   -= release
-        if largest.soldiers <= 0:
-            nation.divisions.remove(largest)
-
-    # ------------------------------------------------------------------
-    # 2. Recruit to maintain baseline ratios (within manpower cap)
-    # ------------------------------------------------------------------
-    ratios = {"Infantry": 0.6}
-    if "Armored" in nation.division_templates:
-        ratios["Armored"] = 0.4
-
-    counts: Dict[str, int] = {k: 0 for k in ratios}
-    for div in nation.divisions:
-        if div.template in counts:
-            counts[div.template] += 1
-
-    total = sum(counts.values())
-    for name, ratio in ratios.items():
-        max_divs = max_soldiers // base_div_size
-        target = max(1, int(max_divs * ratio))
-        while counts.get(name, 0) < target:
-            # Stop recruiting when already at the manpower ceiling
-            current = sum(d.soldiers for d in nation.divisions)
-            if nation.division_templates.get(name) and current + nation.division_templates[name].base_size > max_soldiers:
-                break
-            build_division(nation, name)
-            counts[name] += 1
-            total += 1
-
+def logistic_value(population: float, k: float, manpower_frac: float) -> float:
+    """Return the logistic curve value — soldiers supportable at this population."""
+    # S-curve from 0 to k*manpower_frac
+    midpoint = k * 0.1  # inflection point at 10% of carrying capacity
+    steepness = 0.00001  # tune this
+    return (k * manpower_frac) / (1 + math.exp(-steepness * (population - midpoint)))
 
 def wage_war(
     nation: "Nation",
