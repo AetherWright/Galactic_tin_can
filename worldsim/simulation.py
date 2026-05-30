@@ -24,7 +24,7 @@ from .mp_utils import (
 )
 from .models import AllianceBloc, Nation, Star, STARS
 from .models.war import wage_war
-from .models.diplomacy import update_war_score, accumulate_war_exhaustion, check_war_victory
+from .models.diplomacy import update_war_score, accumulate_war_exhaustion, check_war_victory, enforce_victory
 from .planets import PLANETS, Planet, City, Colony
 from .representations import build_alliance_matrix
 from .utils import APPROXIMATE, VERBOSE, gather_batches, time_limit, vprint, wprint, _compact_pop
@@ -643,10 +643,12 @@ def run_simulation(
             if n.military > 5.0 and n.economy > 5.0:
                 score += 1
             if n.military < 5 and n.economy > 5.0:
-               score -= 1
+               score -= 10
+               if n.divisions:
+                  for _ in range(len(n.divisions)):
+                       score += -4
             for ga in n.reward_ga.values():
-                for _ in range(score):
-                    ga.step
+                ga.step(score)
         for n in nations.values():
             n.step_meta(century)
 
