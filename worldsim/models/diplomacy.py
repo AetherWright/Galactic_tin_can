@@ -146,6 +146,25 @@ class Message:
 
 
 # ---------------------------------------------------------------------------
+# Alliance helpers
+# ---------------------------------------------------------------------------
+
+def get_all_allies(nation: "Nation", nations: Dict[int, "Nation"]) -> Set[int]:
+    """Return the transitive closure of all allied nation ids (including self)."""
+    visited: Set[int] = set()
+    stack = [nation.id]
+    while stack:
+        cur = stack.pop()
+        if cur in visited or cur not in nations:
+            continue
+        visited.add(cur)
+        for ally in nations[cur].alliances:
+            if ally not in visited:
+                stack.append(ally)
+    return visited
+
+
+# ---------------------------------------------------------------------------
 # Communication helpers
 # ---------------------------------------------------------------------------
 

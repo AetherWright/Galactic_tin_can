@@ -17,6 +17,7 @@ from .diplomacy import (
     update_border_pressure as _diplomacy_update_border_pressure,
     compute_trade_bonus    as _diplomacy_trade_bonus,
     collect_tributes       as _diplomacy_collect_tributes,
+    get_all_allies         as _diplomacy_get_all_allies,
 )
 from .economy import Economy
 from ..culture import Culture, ARCHETYPE_BONUSES, ArchetypeBonus
@@ -60,7 +61,15 @@ from ..planets import (
     OrbitalDefense,
 )
 from .tech import Technology, TechnologyTree, setup_default_tech_tree
-from .war import Division, DivisionTemplate, build_division
+from .war import (
+    Division,
+    DivisionTemplate,
+    build_division,
+    produce_nuclear_weapons  as _war_produce_nuclear_weapons,
+    launch_nuclear_strike    as _war_launch_nuclear_strike,
+    launch_first_strike      as _war_launch_first_strike,
+    consider_first_strike    as _war_consider_first_strike,
+)
 from .fleet import Fleet, build_fleet_ship, process_fleet_movement, order_fleet_move
 from .military_ai import DoctrineAI, issue_doctrine
 
@@ -575,17 +584,7 @@ class Nation:
         return new_area <= self.territory
 
     def get_all_allies(self, nations: Dict[int, "Nation"]) -> Set[int]:
-        visited: Set[int] = set()
-        stack = [self.id]
-        while stack:
-            cur = stack.pop()
-            if cur in visited or cur not in nations:
-                continue
-            visited.add(cur)
-            for ally in nations[cur].alliances:
-                if ally not in visited:
-                    stack.append(ally)
-        return visited
+        return _diplomacy_get_all_allies(self, nations)
 
     def can_communicate(self, other: "Nation") -> bool:
         """Return ``True`` if ``other`` is within communication range."""
@@ -1069,118 +1068,19 @@ class Nation:
 
     def produce_nuclear_weapons(self) -> None:
         """Convert uranium, metal and economy into nuclear stockpile."""
-        if "Atomic Engineering" not in self.tech_tree.unlocked:
-            return
-        uranium = self.resources.get("uranium", 0.0)
-        metal = self.resources.get("metal", 0.0)
-        base = int(min(uranium // 10, metal // 20, self.economy_linear // 100))
-        if base <= 0:
-            return
-        rate = sum(f.rate for f in self.nuke_plants) if self.nuke_plants else 1.0
-        possible = int(
-            min(
-                base * rate,
-                self.resources.get("uranium", 0.0) // 10,
-                self.resources.get("metal", 0.0) // 20,
-                self.economy_linear // 100,
-            )
-        )
-        if possible > 0:
-            self.nuclear_stockpile += possible
-            self.resources["uranium"] -= possible * 10
-            self.resources["metal"] -= possible * 20
-            self.economy_linear -= possible * 100
+        _war_produce_nuclear_weapons(self)
 
     def launch_nuclear_strike(self, enemy: "Nation") -> None:
-        """Inflict heavy losses on ``enemy`` using one warhead.
-
-        Beyond physical devastation this strike now also causes a
-        diplomatic collapse between the two nations and destabilises the
-        attacker. Damage to the target nation is intentionally severe to
-        reflect the catastrophic nature of nuclear warfare.
-        """
-
-        # Enter open conflict and ruin diplomatic relations
-        self.relations[enemy.id] = "enemy"
-        enemy.relations[self.id] = "enemy"
-        self.at_war.add(enemy.id)
-        enemy.at_war.add(self.id)
-
-        self.nuclear_stockpile -= 1
-
-        tech_scale = 1.0 + self.technology.military / 100.0
-        defense = sum(d.strength for d in enemy.orbital_defenses)
-        damp = max(0.0, 1.0 - defense)
-
-        casualties = 0
-
-        if enemy.cities:
-            target = max(enemy.cities, key=lambda c: c.population)
-            city_loss = int(target.population * 0.8 * tech_scale * damp)
-            target.population = max(0, target.population - city_loss)
-            infra_loss = max(1, int(target.infrastructure * 0.7 * damp))
-            target.infrastructure = max(0, target.infrastructure - infra_loss)
-            casualties += city_loss
-        else:
-            casualties += int(enemy.population * 0.2 * damp)
-
-        enemy.population = max(0, enemy.population - casualties)
-        enemy.economy_linear *= 0.3 * damp
-        enemy.stability = max(0.0, enemy.stability - 40 * damp)
-        self.stability = max(0.0, self.stability - 10)
-
-        planet = PLANETS.get(enemy.planet)
-        if planet:
-            planet.radiation_level = min(1.0, planet.radiation_level + 0.4 * damp)
-
-        wprint(self.name, f"  {self.name} launches a nuclear strike on {enemy.name}!")
+        """Inflict heavy losses on ``enemy`` using one warhead."""
+        _war_launch_nuclear_strike(self, enemy)
 
     def launch_first_strike(self, enemies: List["Nation"]) -> None:
-        """Launch all available warheads across ``enemies``.
-
-        Warheads are distributed in round-robin fashion. After each hit the
-        targeted nation may immediately retaliate with a single strike if
-        it has remaining weapons. This models a rapid escalation typical
-        of all-out nuclear exchanges.
-        """
-
-        if self.nuclear_stockpile <= 0 or not enemies:
-            return
-
-        idx = 0
-        # Disperse warheads sequentially among enemies
-        while self.nuclear_stockpile > 0:
-            enemy = enemies[idx % len(enemies)]
-            self.launch_nuclear_strike(enemy)
-            if enemy.nuclear_stockpile > 0 and random.random() < 0.5:
-                enemy.launch_nuclear_strike(self)
-            idx += 1
+        """Launch all available warheads across ``enemies`` in round-robin fashion."""
+        _war_launch_first_strike(self, enemies)
 
     def consider_first_strike(self, nations: Dict[int, "Nation"]) -> None:
         """Allow the military AI to initiate a nuclear first strike."""
-
-        if not self.military_ai or self.nuclear_stockpile <= 0:
-            return
-        potential = [
-            n
-            for n in nations.values()
-            if n.id != self.id
-            and n.id not in self.at_war
-            and self.relations.get(n.id, "neutral") != "ally"
-        ]
-        if not potential:
-            return
-        state = [
-            float(self.nuclear_stockpile),
-            self.military,
-            self.economy,
-            self.stability,
-            float(sum(e.nuclear_stockpile for e in potential)),
-        ]
-        act = self.military_ai.choose_action(state)
-        if act == 1:
-            target = max(potential, key=lambda n: n.military)
-            self.launch_first_strike([target])
+        _war_consider_first_strike(self, nations)
 
     def available_projects(self) -> List[str]:
         """Return project names that can currently be started."""
