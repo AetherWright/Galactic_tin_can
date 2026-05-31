@@ -25,16 +25,16 @@ from .diplomacy import (
     PARTNER_TRADE_RATE,
     ALLY_WAR_ENTRY_CHANCE,
 )
-from .nation import (
+from .nation import Nation
+from .government import (
     Government,
     NationalProject,
     ProjectSpec,
     PROJECT_CATALOG,
     PROJECT_NAMES,
-    Nation,
-    Star,
-    STARS,
+    RESOURCE_COSTS,
 )
+from .star import Star, STARS
 from .tech import (
     Technology,
     TechnologyNode,
@@ -69,6 +69,7 @@ __all__ = [
     "ProjectSpec",
     "PROJECT_CATALOG",
     "PROJECT_NAMES",
+    "RESOURCE_COSTS",
     "Nation",
     "Star",
     "STARS",
