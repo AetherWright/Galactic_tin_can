@@ -1,12 +1,15 @@
-"""Government archetype model, national projects, and infrastructure cost tables."""
+"""Government archetype model."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, TYPE_CHECKING
+from typing import Dict, TYPE_CHECKING
 
 from ..culture import ARCHETYPE_BONUSES, ArchetypeBonus
-from ..config import load_json
+
+# Re-export moved symbols so existing ``from .government import X`` keeps working.
+from .projects import NationalProject, ProjectSpec, PROJECT_CATALOG, PROJECT_NAMES
+from .infrastructure import RESOURCE_COSTS
 
 if TYPE_CHECKING:
     from .nation import Nation
@@ -70,83 +73,3 @@ class Government:
             "stability": bonus.stability_flat,
             "military": bonus.military_flat,
         }
-
-
-@dataclass(slots=True)
-class NationalProject:
-    """Large-scale construction tracked at the nation level."""
-
-    name: str
-    cost: float
-    progress: float = 0.0
-    on_complete: Optional[callable] = None
-    prereqs: Set[str] = field(default_factory=set)
-
-    def advance(self, amount: float) -> bool:
-        """Increase progress by ``amount`` and return ``True`` if finished."""
-        remaining = max(self.cost - self.progress, 0.0)
-        factor = remaining / self.cost if self.cost else 1.0
-        self.progress += amount * factor
-        return self.progress >= self.cost
-
-
-@dataclass(slots=True)
-class ProjectSpec:
-    """Specification for a buildable national project."""
-
-    cost: float
-    on_complete: callable
-    prereqs: Set[str] = field(default_factory=set)
-
-
-PROJECT_CATALOG: Dict[str, ProjectSpec] = {
-    "Highway Network": ProjectSpec(
-        100.0,
-        lambda n: setattr(n, "infrastructure", n.infrastructure + 20),
-    ),
-    "Research Complex": ProjectSpec(
-        80.0,
-        lambda n: setattr(
-            n.technology, "science", min(100.0, n.technology.science + 10.0)
-        ),
-        {"Highway Network"},
-    ),
-    "Orbital Defense Grid": ProjectSpec(
-        120.0,
-        lambda n: setattr(n, "military", n.military + 20),
-    ),
-    "Mega Dam": ProjectSpec(
-        90.0,
-        lambda n: (
-            setattr(n, "infrastructure", n.infrastructure + 15),
-            setattr(n, "economy_linear", n.economy_linear + 20),
-        ),
-        {"Highway Network"},
-    ),
-    "AI Governance System": ProjectSpec(
-        110.0,
-        lambda n: (
-            setattr(n, "stability", min(100.0, n.stability + 20)),
-            setattr(n.technology, "industry", min(100.0, n.technology.industry + 10.0)),
-        ),
-        {"Research Complex"},
-    ),
-    "Resilience Program": ProjectSpec(
-        130.0,
-        lambda n: setattr(n, "resilience", min(100.0, n.resilience + 30.0)),
-    ),
-    "Orbital Shipyard": ProjectSpec(
-        150.0,
-        lambda n: (
-            setattr(n, "military", n.military + 30),
-            setattr(n, "infrastructure", n.infrastructure + 10),
-        ),
-        {"Orbital Defense Grid"},
-    ),
-}
-
-# Maintains deterministic order for project indexing
-PROJECT_NAMES: List[str] = list(PROJECT_CATALOG.keys())
-
-# Resource costs for constructing various assets
-RESOURCE_COSTS: Dict[str, Dict[str, float]] = load_json("resource_costs")

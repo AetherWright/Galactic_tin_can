@@ -12,7 +12,7 @@ from typing import Dict, List, TYPE_CHECKING
 from ..utils import distance_sq
 from ..planets import PLANETS
 from .war import build_division
-from .government import PROJECT_CATALOG, PROJECT_NAMES, NationalProject
+from .projects import PROJECT_CATALOG, PROJECT_NAMES, NationalProject
 from .star import STARS
 
 if TYPE_CHECKING:

@@ -26,14 +26,9 @@ from .diplomacy import (
     ALLY_WAR_ENTRY_CHANCE,
 )
 from .nation import Nation
-from .government import (
-    Government,
-    NationalProject,
-    ProjectSpec,
-    PROJECT_CATALOG,
-    PROJECT_NAMES,
-    RESOURCE_COSTS,
-)
+from .government import Government
+from .projects import NationalProject, ProjectSpec, PROJECT_CATALOG, PROJECT_NAMES
+from .infrastructure import RESOURCE_COSTS
 from .star import Star, STARS
 from .tech import (
     Technology,

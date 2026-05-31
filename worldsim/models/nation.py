@@ -75,13 +75,34 @@ from .military_ai import DoctrineAI, issue_doctrine
 
 # Re-export moved symbols so existing ``from .nation import X`` imports keep working.
 from .star import Star, STARS
-from .government import (
-    Government,
+from .government import Government
+from .projects import (
     NationalProject,
     ProjectSpec,
     PROJECT_CATALOG,
     PROJECT_NAMES,
+    available_projects  as _proj_available_projects,
+    start_project       as _proj_start_project,
+    progress_projects   as _proj_progress_projects,
+)
+from .infrastructure import (
     RESOURCE_COSTS,
+    collect_resources   as _infra_collect_resources,
+    build_city          as _infra_build_city,
+    build_base          as _infra_build_base,
+    build_mine          as _infra_build_mine,
+    build_port          as _infra_build_port,
+    build_factory       as _infra_build_factory,
+    build_hospital      as _infra_build_hospital,
+    build_shipyard      as _infra_build_shipyard,
+    build_school        as _infra_build_school,
+    build_power_plant   as _infra_build_power_plant,
+    build_lab           as _infra_build_lab,
+    build_nuke_facility as _infra_build_nuke_facility,
+    build_orbital_defense as _infra_build_orbital_defense,
+    build_spaceport     as _infra_build_spaceport,
+    upgrade_assets      as _infra_upgrade_assets,
+    colonize_planet     as _infra_colonize_planet,
 )
 from .civilian_controller import (
     _civilian_state        as _cc_civilian_state,
@@ -459,25 +480,7 @@ class Nation:
         _diplomacy_supply_nation(self, other, military=military, economy=economy)
 
     def collect_resources(self) -> None:
-        for mine in self.mines:
-            planet = PLANETS.get(mine.planet)
-            if not planet:
-                continue
-            gained_m = planet.extract_resource("metal", mine.output)
-            self.add_resource("metal", gained_m)
-            gained_u = planet.extract_resource("uranium", getattr(mine, "uranium", 0.0))
-            self.add_resource("uranium", gained_u)
-        for plant in self.power_plants:
-            planet = PLANETS.get(plant.planet)
-            if not planet:
-                continue
-            gained = planet.extract_resource("energy", plant.output)
-            self.add_resource("energy", gained)
-        for _city in self.cities:
-            planet = PLANETS.get(_city.planet)
-            if not planet:
-                continue
-            self.add_resource("food", planet.extract_resource("food", 5.0))
+        _infra_collect_resources(self)
 
     def process_turn(self, nations: Dict[int, "Nation"]) -> None:
         self._centroid_updated_this_turn = False
@@ -606,212 +609,40 @@ class Nation:
                 )
 
     def build_city(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet:
-            return
-        cost = RESOURCE_COSTS["city"]
-        if not self.has_resources(cost):
-            return
-        free = [co for co in planet.iter_colonies() if co.owner is None]
-        for co in free:
-            if self._can_add_city(co):
-                co.owner = self.id
-                planet.register_colony_usage(co)
-                city = planet.upgrade_colony(co, self.id)
-                self.cities.append(city)
-                if co in self.colonies:
-                    self.colonies.remove(co)
-                self.infrastructure += 1
-                self.spend_resources(cost)
-                self._update_centroids()
-                break
+        _infra_build_city(self)
 
     def build_base(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["base"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.bases:
-            # Existing base; treat as capacity upgrade
-            self.spend_resources(cost)
-            return
-        base = MilitaryBase(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_base(base)
-        self.bases.append(base)
-        self.spend_resources(cost)
+        _infra_build_base(self)
 
     def build_mine(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["mine"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.mines:
-            # Existing mine; invest to expand output
-            self.spend_resources(cost)
-            return
-        mine = Mine(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_mine(mine)
-        self.mines.append(mine)
-        self.spend_resources(cost)
+        _infra_build_mine(self)
 
     def build_port(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["port"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.ports:
-            # Upgrade existing port rather than build anew
-            self.spend_resources(cost)
-            return
-        port = Port(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_port(port)
-        self.ports.append(port)
-        self.spend_resources(cost)
+        _infra_build_port(self)
 
     def build_factory(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["factory"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.factories:
-            # Expand current factory capacity
-            self.spend_resources(cost)
-            return
-        fac = Factory(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_factory(fac)
-        self.factories.append(fac)
-        self.spend_resources(cost)
+        _infra_build_factory(self)
 
     def build_hospital(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["hospital"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.hospitals:
-            # Upgrade existing hospital facilities
-            self.spend_resources(cost)
-            return
-        hos = Hospital(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_hospital(hos)
-        self.hospitals.append(hos)
-        self.spend_resources(cost)
+        _infra_build_hospital(self)
 
     def build_shipyard(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["shipyard"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.shipyards:
-            # Expand current shipyard
-            self.spend_resources(cost)
-            return
-        yard = Shipyard(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_shipyard(yard)
-        self.shipyards.append(yard)
-        self.spend_resources(cost)
+        _infra_build_shipyard(self)
 
     def build_school(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["school"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.schools:
-            # Improve existing school
-            self.spend_resources(cost)
-            return
-        school = School(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_school(school)
-        self.schools.append(school)
-        self.spend_resources(cost)
+        _infra_build_school(self)
 
     def build_power_plant(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["power_plant"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.power_plants:
-            # Boost existing plant efficiency
-            self.spend_resources(cost)
-            return
-        plant = PowerPlant(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_power_plant(plant)
-        self.power_plants.append(plant)
-        self.spend_resources(cost)
+        _infra_build_power_plant(self)
 
     def build_lab(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["lab"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.labs:
-            # Upgrade existing research lab
-            self.spend_resources(cost)
-            return
-        lab = ResearchLab(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_lab(lab)
-        self.labs.append(lab)
-        self.spend_resources(cost)
+        _infra_build_lab(self)
 
     def build_nuke_facility(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["nuke_facility"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.nuke_plants:
-            # Expand current nuclear facility
-            self.spend_resources(cost)
-            return
-        fac = NuclearFacility(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_nuke_facility(fac)
-        self.nuke_plants.append(fac)
-        self.spend_resources(cost)
+        _infra_build_nuke_facility(self)
 
     def build_orbital_defense(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["orbital_defense"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.orbital_defenses:
-            # Reinforce existing orbital defense
-            self.spend_resources(cost)
-            return
-        od = OrbitalDefense(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_orbital_defense(od)
-        self.orbital_defenses.append(od)
-        self.spend_resources(cost)
+        _infra_build_orbital_defense(self)
 
     def build_fleet_ship(self, template_name: str = "Frigate") -> None:
         """Build one ship of ``template_name`` and add it to a fleet."""
@@ -831,83 +662,15 @@ class Nation:
         return order_fleet_move(self, fleet, destination, distance_ly, divisions_to_load)
 
     def build_spaceport(self) -> None:
-        planet = PLANETS.get(self.planet)
-        if not planet or not self.cities:
-            return
-        cost = RESOURCE_COSTS["spaceport"]
-        if not self.has_resources(cost):
-            return
-        anchor = max(self.cities, key=lambda c: c.population)
-        if (anchor.x, anchor.y) in planet.spaceports:
-            # Extend existing spaceport capacity
-            self.spend_resources(cost)
-            return
-        port = Spaceport(anchor.x, anchor.y, self.planet, owner=self.id)
-        planet.add_spaceport(port)
-        self.spaceports.append(port)
-        self.spend_resources(cost)
+        _infra_build_spaceport(self)
 
     def colonize_planet(self) -> None:
         """Attempt to found a city on another planet if one is free."""
-        # pick any planet with an unowned colony
-        candidates = []
-        for planet in PLANETS.values():
-            free = [c for c in planet.iter_colonies() if c.owner is None]
-            if free:
-                candidates.append((planet, free))
-        if not candidates:
-            return
-        candidates.sort(key=lambda item: -len(item[1]))
-        for target, free in candidates:
-            for colony in free:
-                if self._can_add_city(colony):
-                    colony.owner = self.id
-                    target.register_colony_usage(colony)
-                    city = target.upgrade_colony(colony, self.id)
-                    self.cities.append(city)
-                    if colony in self.colonies:
-                        self.colonies.remove(colony)
-                    self._update_centroids()
-                    return
+        _infra_colonize_planet(self)
 
     def upgrade_assets(self) -> None:
         """Invest economy into upgrading owned infrastructure."""
-
-        if self.economy_linear <= 0:
-            return
-        if self.cities and self.economy_linear >= 20:
-            self.cities[0].upgrade()
-            self.economy_linear -= 20
-        if self.bases and self.economy_linear >= 15:
-            self.bases[0].upgrade()
-            self.economy_linear -= 15
-        if self.mines and self.economy_linear >= 10:
-            self.mines[0].upgrade()
-            self.economy_linear -= 10
-        if self.ports and self.economy_linear >= 15:
-            self.ports[0].upgrade()
-            self.economy_linear -= 15
-        if self.factories and self.economy_linear >= 20:
-            self.factories[0].upgrade()
-            self.economy_linear -= 20
-        if self.hospitals and self.economy_linear >= 10:
-            self.hospitals[0].upgrade()
-            self.economy_linear -= 10
-        if self.shipyards and self.economy_linear >= 20:
-            self.shipyards[0].upgrade()
-            self.economy_linear -= 20
-        if self.schools and self.economy_linear >= 10:
-            self.schools[0].upgrade()
-            self.economy_linear -= 10
-        if self.labs and self.economy_linear >= 10:
-            self.labs[0].upgrade()
-            self.economy_linear -= 10
-        if self.power_plants and self.economy_linear >= 15:
-            self.power_plants[0].upgrade()
-            self.economy_linear -= 15
-        if self.spaceports and self.economy_linear >= 20:
-            self.spaceports[0].upgrade()
-            self.economy_linear -= 20
+        _infra_upgrade_assets(self)
 
     def produce_nuclear_weapons(self) -> None:
         """Convert uranium, metal and economy into nuclear stockpile."""
@@ -927,57 +690,15 @@ class Nation:
 
     def available_projects(self) -> List[str]:
         """Return project names that can currently be started."""
-        opts: List[str] = []
-        for pname, spec in PROJECT_CATALOG.items():
-            if pname in self.completed_projects:
-                continue
-            if any(p.name == pname for p in self.projects):
-                continue
-            if not spec.prereqs.issubset(set(self.completed_projects)):
-                continue
-            opts.append(pname)
-        return opts
+        return _proj_available_projects(self)
 
     def start_project(self, name: Optional[str] = None) -> None:
         """Begin a new national project if resources allow."""
-        if len(self.projects) >= 2 or self.economy_linear < 50:
-            return
-        options = self.available_projects()
-        if not options:
-            return
-        state = self._civilian_state()
-        if name is None or name not in options:
-            idx = self.project_ai.choose_action(state)
-            choice = PROJECT_NAMES[idx % len(PROJECT_NAMES)]
-            if choice not in options:
-                choice = options[0]
-        else:
-            choice = name
-        spec = PROJECT_CATALOG[choice]
-        self.projects.append(
-            NationalProject(choice, spec.cost, 0.0, spec.on_complete, spec.prereqs)
-        )
-        new_state = self._civilian_state()
-        reward = self.compute_reward("projects", state, new_state)
-        self.project_ai.train(state, PROJECT_NAMES.index(choice), reward, new_state)
+        _proj_start_project(self, name)
 
     def progress_projects(self) -> None:
         """Spend economy to advance national projects."""
-        if not self.projects or self.economy_linear <= 0:
-            return
-        invest = min(self.economy_linear, 20 * len(self.projects))
-        per = invest / len(self.projects)
-        self.economy_linear -= invest
-        finished: List[NationalProject] = []
-        for prj in self.projects:
-            if prj.advance(per):
-                if prj.on_complete:
-                    prj.on_complete(self)
-                self.completed_projects.append(prj.name)
-                finished.append(prj)
-        for prj in finished:
-            if prj in self.projects:
-                self.projects.remove(prj)
+        _proj_progress_projects(self)
     @property
     def star_count(self) -> int:
         return sum(1 for s in STARS.values() if s.owner == self.id)
