@@ -221,6 +221,8 @@ class TechnologySubsystem:
 
     #: Human-readable subsystem name (also used as the AI table role suffix).
     name: str = "subsystem"
+    #: Input dimensionality for this subsystem's ResearchAI; overridden per subclass.
+    _n_inputs: int = 4
 
     def __init__(self) -> None:
         self.tree = TechnologyTree()
@@ -263,30 +265,24 @@ class TechnologySubsystem:
         self.base_names = set(self.tree.nodes)
 
     def attach_ai(self) -> None:
-        """Create this subsystem's :class:`ResearchAI`.
-
-        # TODO: Aether — AI architecture parameters (input dimensionality and
-        # hidden-layer topology) per subsystem.  We currently construct the AI
-        # with the number of researchable nodes as the action count and rely on
-        # ``ResearchAI``'s own default ``n_inputs`` / ``hidden_layers`` — these
-        # defaults are placeholders, not tuned values.  An empty subsystem gets
-        # no AI (selection is a no-op / heuristic until nodes exist).
-        """
+        """Create this subsystem's :class:`ResearchAI` using :attr:`_n_inputs`."""
         n_actions = len(self.tree.nodes)
         if n_actions <= 0:
             self.ai = None
             return
-        self.ai = ResearchAI(n_actions)
+        # # TODO: Aether — hidden-layer topology per subsystem; the ResearchAI
+        # # default ``(10, 8, 6, 4, 3, 4, 6, 8, 10)`` is a placeholder.
+        self.ai = ResearchAI(n_actions, n_inputs=self._n_inputs)
 
     # -- per-tick research -------------------------------------------------
     def _build_state(self, nation: "Nation") -> Optional[List[float]]:
         """Return the AI state vector for technology selection.
 
-        # TODO: Aether — define the state-vector contents for this subsystem's
-        # ResearchAI (e.g. counts of unlocked nodes, pending prerequisites,
-        # relevant nation metrics, current bonus levels).  Returning ``None``
-        # makes :meth:`research` fall back to the deterministic cheapest-first
-        # heuristic so that no state values are fabricated here.
+        Subclasses with a defined state vector override this.  Returning
+        ``None`` makes :meth:`research` fall back to cheapest-first heuristic.
+
+        # TODO: Aether — define state-vector contents for biology (and any
+        # future subsystem) once their research domain is populated.
         """
         return None
 
@@ -299,9 +295,8 @@ class TechnologySubsystem:
             if self.ai is not None and state is not None:
                 idx = self.ai.choose_action(state) % len(options)
                 choice = options[idx]
-                # # TODO: Aether — train the subsystem ResearchAI here
-                # # (reward shaping + new-state vector once _build_state is real).
             else:
+                idx = None
                 choice = min(options, key=lambda n: n.cost)
             if self.tree.research_points < choice.cost:
                 break
@@ -310,6 +305,10 @@ class TechnologySubsystem:
             if choice.effect:
                 choice.effect(nation)
             self._maybe_grow(nation)
+            if self.ai is not None and state is not None and idx is not None:
+                new_state = self._build_state(nation)
+                reward = nation.compute_reward("research", state, new_state)
+                self.ai.train(state, idx, reward, new_state)
             options = self.available()
 
     def _maybe_grow(self, nation: "Nation") -> None:
@@ -361,6 +360,34 @@ def _nuclear(n: "Nation") -> None:
     n.tech_bonuses["nuclear_power"] = 1.0
 
 
+# ---------------------------------------------------------------------------
+# State-vector helpers for subsystem ResearchAIs
+# ---------------------------------------------------------------------------
+
+def _cross_demand_pressure(nation: "Nation") -> float:
+    """Fraction of engineering nodes blocked specifically by unmet physics prereqs."""
+    director = nation.tech_tree
+    if not hasattr(director, "physics"):
+        return 0.0
+    physics_names: Set[str] = set(director.physics.nodes)
+    global_unlocked: Set[str] = director.unlocked
+    eng_unlocked: Set[str] = director.engineering.unlocked
+    blocked = sum(
+        1
+        for node in director.engineering.nodes.values()
+        if node.name not in eng_unlocked
+        and (node.prerequisites - global_unlocked) & physics_names
+    )
+    return blocked / max(1, len(director.engineering.nodes))
+
+
+def _ftl_unlock_ratio(nation: "Nation") -> float:
+    """Fraction of the FTL tier ladder that has been unlocked."""
+    from .ftl import FTL_TIER_ORDER
+    unlocked = nation.tech_tree.unlocked
+    return sum(1 for name in FTL_TIER_ORDER if name in unlocked) / len(FTL_TIER_ORDER)
+
+
 class PhysicsSubsystem(TechnologySubsystem):
     """Fundamental science: the theoretical half of the civilization chain.
 
@@ -370,6 +397,25 @@ class PhysicsSubsystem(TechnologySubsystem):
     """
 
     name = "physics"
+    _n_inputs = 8
+
+    def _build_state(self, nation: "Nation") -> Optional[List[float]]:
+        total_nodes = max(
+            1,
+            sum(len(s.nodes) for s in self.director.subsystems)
+            if self.director is not None
+            else len(self.nodes),
+        )
+        return [
+            nation.technology.science / 100.0,           # 0: current science level
+            nation.technology.industry / 100.0,          # 1: industry (cross-subsystem signal)
+            len(self.unlocked) / max(1, len(self.nodes)), # 2: physics completion ratio
+            len(self.available()) / max(1, len(self.nodes)), # 3: available-node ratio
+            len(self.global_unlocked()) / total_nodes,   # 4: global research progress
+            nation.economy / 10000.0,                    # 5: economy (normalised)
+            float(len(nation.labs)) / 10.0,              # 6: research infrastructure
+            _cross_demand_pressure(nation),              # 7: eng nodes blocked by physics prereqs
+        ]
 
     def build_nodes(self, nation: "Nation") -> None:
         t = self.tree
@@ -392,6 +438,23 @@ class EngineeringSubsystem(TechnologySubsystem):
     """
 
     name = "engineering"
+    _n_inputs = 12
+
+    def _build_state(self, nation: "Nation") -> Optional[List[float]]:
+        return [
+            nation.technology.industry / 100.0,              # 0: industry level
+            nation.technology.military / 100.0,              # 1: military level
+            len(self.unlocked) / max(1, len(self.nodes)),    # 2: engineering completion ratio
+            len(self.available()) / max(1, len(self.nodes)), # 3: available-node ratio
+            nation.economy / 10000.0,                        # 4: economy (normalised)
+            float(len(nation.factories)) / 10.0,             # 5: factory infrastructure
+            float(len(nation.mines)) / 10.0,                 # 6: mining infrastructure
+            float(len(nation.at_war)) / 10.0,                # 7: war pressure
+            float(nation.nuclear_stockpile) / 100.0,         # 8: nuclear development
+            _ftl_unlock_ratio(nation),                       # 9: FTL tier progress
+            float(len(nation.cities)) / 50.0,                # 10: city count
+            float(nation.star_count) / 10.0,                 # 11: stellar footprint
+        ]
 
     def build_nodes(self, nation: "Nation") -> None:
         t = self.tree
