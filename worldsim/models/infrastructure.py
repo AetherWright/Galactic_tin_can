@@ -48,11 +48,13 @@ def collect_resources(nation: "Nation") -> None:
             continue
         gained = planet.extract_resource("energy", plant.output)
         nation.add_resource("energy", gained)
+    # biology: Synthetic Biology raises agricultural yield (food_output)
+    food_mult = nation.tech_bonuses.get("food_output", 1.0)
     for _city in nation.cities:
         planet = PLANETS.get(_city.planet)
         if not planet:
             continue
-        nation.add_resource("food", planet.extract_resource("food", 5.0))
+        nation.add_resource("food", planet.extract_resource("food", 5.0 * food_mult))
 
 
 # ---------------------------------------------------------------------------

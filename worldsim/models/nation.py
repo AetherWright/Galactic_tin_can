@@ -496,7 +496,9 @@ class Nation:
         radiation_level = planet.radiation_level if planet else 0.0
         cbonus = self.tech_bonuses.get("city_output", 1.0)
         pop, econ = process_city_batch(
-            self.cities, plague_level, radiation_level, plague_res, cbonus
+            self.cities, plague_level, radiation_level, plague_res, cbonus,
+            self.tech_bonuses.get("pop_growth", 1.0),   # biology: Pharmacology
+            self.tech_bonuses.get("pop_cap", 1.0),      # biology: Genetic Engineering
         )
         total_pop += pop
         total_econ += econ
@@ -526,23 +528,29 @@ class Nation:
             research_bonus += float(arr.sum())
         else:
             research_bonus += sum(s.education for s in self.schools)
+        # biology: Cell Biology boosts lab yield (lab_effectiveness)
+        lab_eff = self.tech_bonuses.get("lab_effectiveness", 1.0)
         if _np is not None and self.labs:
             arr = _np.array([l.output for l in self.labs], dtype=float)
-            research_bonus += float(arr.sum())
+            research_bonus += float(arr.sum()) * lab_eff
         else:
-            research_bonus += sum(l.output for l in self.labs)
+            research_bonus += sum(l.output for l in self.labs) * lab_eff
+        # biology: Cell Biology general research multiplier (research_mult)
+        research_bonus *= self.tech_bonuses.get("research_mult", 1.0)
 
+        # biology: Medicine boosts hospital plague suppression (hospital_effectiveness)
+        hosp_eff = self.tech_bonuses.get("hospital_effectiveness", 1.0)
         if _np is not None and self.hospitals:
             levels = _np.array([hos.level for hos in self.hospitals], dtype=float)
             for hos, level in zip(self.hospitals, levels.tolist()):
                 planet = PLANETS.get(hos.planet)
                 if planet:
-                    planet.plague_level = max(0.0, planet.plague_level - level * 0.005)
+                    planet.plague_level = max(0.0, planet.plague_level - level * 0.005 * hosp_eff)
         else:
             for hos in self.hospitals:
                 planet = PLANETS.get(hos.planet)
                 if planet:
-                    planet.plague_level = max(0.0, planet.plague_level - hos.level * 0.005)
+                    planet.plague_level = max(0.0, planet.plague_level - hos.level * 0.005 * hosp_eff)
 
         if _np is not None and self.ports:
             arr = _np.array([p.bonus for p in self.ports], dtype=float)

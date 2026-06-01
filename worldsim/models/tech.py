@@ -456,6 +456,33 @@ def _ftl_unlock_ratio(nation: "Nation") -> float:
     return sum(1 for name in FTL_TIER_ORDER if name in unlocked) / len(FTL_TIER_ORDER)
 
 
+# Biology track membership — drives the per-track completion state features.
+_ECOLOGY_TRACK = ("Botany", "Ecosystem Mapping", "Synthetic Ecology", "Terraforming")
+_MEDICINE_TRACK = (
+    "Herbalism", "Medicine", "Pharmacology", "Advanced Medicine", "Genetic Medicine",
+)
+_GENETICS_TRACK = (
+    "Cell Biology", "Genetic Engineering", "Synthetic Biology", "Directed Evolution",
+)
+
+
+def _track_completion(subsystem: "TechnologySubsystem", track) -> float:
+    unlocked = subsystem.unlocked
+    return sum(1 for name in track if name in unlocked) / len(track)
+
+
+def _ecology_completion(subsystem: "TechnologySubsystem") -> float:
+    return _track_completion(subsystem, _ECOLOGY_TRACK)
+
+
+def _medicine_completion(subsystem: "TechnologySubsystem") -> float:
+    return _track_completion(subsystem, _MEDICINE_TRACK)
+
+
+def _genetics_completion(subsystem: "TechnologySubsystem") -> float:
+    return _track_completion(subsystem, _GENETICS_TRACK)
+
+
 class PhysicsSubsystem(TechnologySubsystem):
     """Fundamental science: the theoretical half of the civilization chain.
 
@@ -548,15 +575,28 @@ class BiologySubsystem(TechnologySubsystem):
     "Synthetic Ecology") and one node ("Terraforming") depends on engineering's
     "Industrialization", exercising both cross-track and cross-subsystem
     prerequisites.  All tracks root at "Botany".
-
-    # TODO: Aether — biology ResearchAI state vector.  Until ``_build_state``
-    # is defined (it returns ``None`` via the base class), node selection uses
-    # the cheapest-first heuristic and the biology AI stays untrained.
     """
 
     name = "biology"
-    # # TODO: Aether — biology-specific _n_inputs once its state vector exists;
-    # # currently the AI is constructed but never invoked (heuristic selection).
+    _n_inputs = 12
+
+    def _build_state(self, nation: "Nation") -> Optional[List[float]]:
+        from ..planets import PLANETS
+        planet = PLANETS.get(nation.planet)
+        return [
+            nation.technology.science / 100.0,               # 0: science (cross-subsystem)
+            len(self.unlocked) / max(1, len(self.nodes)),    # 1: biology completion ratio
+            len(self.available()) / max(1, len(self.nodes)), # 2: available-node ratio
+            nation.resources.get("food", 0.0) / 1000.0,      # 3: food supply pressure
+            float(nation.population) / 1_000_000.0,          # 4: population scale
+            planet.plague_level if planet else 0.0,          # 5: active plague pressure
+            float(len(nation.hospitals)) / 10.0,             # 6: medical infrastructure
+            float(len(nation.colonies)) / 10.0,              # 7: colonization scale
+            float(nation.star_count) / 10.0,                 # 8: stellar footprint
+            _ecology_completion(self),                       # 9: ecology track ratio
+            _medicine_completion(self),                      # 10: medicine track ratio
+            _genetics_completion(self),                      # 11: genetics track ratio
+        ]
 
     def build_nodes(self, nation: "Nation") -> None:
         t = self.tree
