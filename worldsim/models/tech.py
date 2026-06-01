@@ -75,6 +75,10 @@ def _mult_bonus(n: "Nation", key: str, factor: float, cap: float = 5.0) -> None:
     n.tech_bonuses[key] = min(n.tech_bonuses.get(key, 1.0) * factor, cap)
 
 
+def _add_bonus(n: "Nation", key: str, amount: float) -> None:
+    n.tech_bonuses[key] = n.tech_bonuses.get(key, 0.0) + amount
+
+
 def generate_tech_name() -> str:
     """Return a unique technology name."""
     idx = next(_TECH_COUNTER)
@@ -360,6 +364,70 @@ def _nuclear(n: "Nation") -> None:
     n.tech_bonuses["nuclear_power"] = 1.0
 
 
+# -- Biology: Ecology track -------------------------------------------------
+def _botany(n: "Nation") -> None:
+    _mult_bonus(n, "city_output", 1.05)
+    _add_bonus(n, "plague_resist", 0.05)
+
+
+def _ecosystem_mapping(n: "Nation") -> None:
+    # Signals terraforming readiness and improves colony viability.
+    n.tech_bonuses["terraform_readiness"] = 1.0
+    _mult_bonus(n, "colony_viability", 1.1)
+
+
+def _synthetic_ecology(n: "Nation") -> None:
+    _mult_bonus(n, "habitability", 1.15)
+
+
+def _terraforming(n: "Nation") -> None:
+    # Flag consumed by colonization to unlock new colony types.
+    n.tech_bonuses["terraforming"] = 1.0
+
+
+# -- Biology: Medicine track ------------------------------------------------
+def _herbalism(n: "Nation") -> None:
+    _add_bonus(n, "plague_resist", 0.1)
+
+
+def _medicine(n: "Nation") -> None:
+    _add_bonus(n, "plague_resist", 0.2)
+    _mult_bonus(n, "hospital_effectiveness", 1.1)
+
+
+def _pharmacology(n: "Nation") -> None:
+    _add_bonus(n, "plague_resist", 0.3)
+    _mult_bonus(n, "pop_growth", 1.1)
+
+
+def _advanced_medicine(n: "Nation") -> None:
+    _add_bonus(n, "plague_resist", 0.4)
+
+
+def _genetic_medicine(n: "Nation") -> None:
+    _add_bonus(n, "plague_resist", 0.5)
+    _mult_bonus(n, "resilience_bonus", 1.1)
+
+
+# -- Biology: Genetics track ------------------------------------------------
+def _cell_biology(n: "Nation") -> None:
+    _mult_bonus(n, "research_mult", 1.1)
+    _mult_bonus(n, "lab_effectiveness", 1.1)
+
+
+def _genetic_engineering(n: "Nation") -> None:
+    _mult_bonus(n, "pop_cap", 1.1)
+    _mult_bonus(n, "mutation_rate", 1.1)
+
+
+def _synthetic_biology(n: "Nation") -> None:
+    _mult_bonus(n, "food_output", 1.15)
+
+
+def _directed_evolution(n: "Nation") -> None:
+    _mult_bonus(n, "adaptive_colonization", 1.1)
+
+
 # ---------------------------------------------------------------------------
 # State-vector helpers for subsystem ResearchAIs
 # ---------------------------------------------------------------------------
@@ -474,20 +542,57 @@ class EngineeringSubsystem(TechnologySubsystem):
 
 
 class BiologySubsystem(TechnologySubsystem):
-    """Life sciences: medicine, agronomy, genetics.
+    """Life sciences: a three-track tree of ecology, medicine and genetics.
 
-    Distinct from the physics/engineering civilization chain.  Its concrete
-    technology catalogue is intentionally left for design.
+    The tracks interleave (e.g. genetics' "Genetic Engineering" gates ecology's
+    "Synthetic Ecology") and one node ("Terraforming") depends on engineering's
+    "Industrialization", exercising both cross-track and cross-subsystem
+    prerequisites.  All tracks root at "Botany".
+
+    # TODO: Aether — biology ResearchAI state vector.  Until ``_build_state``
+    # is defined (it returns ``None`` via the base class), node selection uses
+    # the cheapest-first heuristic and the biology AI stays untrained.
     """
 
     name = "biology"
+    # # TODO: Aether — biology-specific _n_inputs once its state vector exists;
+    # # currently the AI is constructed but never invoked (heuristic selection).
 
     def build_nodes(self, nation: "Nation") -> None:
-        # # TODO: Aether — biology technology names and effects (e.g. medicine →
-        # # ``plague_resist``, genetics, terraforming, life-support).  Until
-        # # populated this subsystem has no researchable nodes, so the director
-        # # will simply not allocate effective research to it.
-        pass
+        t = self.tree
+        # Ecology track
+        t.add_node(TechnologyNode("Botany", 50, effect=_botany))
+        t.add_node(TechnologyNode("Ecosystem Mapping", 70, {"Botany"}, _ecosystem_mapping))
+        t.add_node(TechnologyNode(
+            "Synthetic Ecology", 120,
+            {"Ecosystem Mapping", "Genetic Engineering"}, _synthetic_ecology,
+        ))
+        t.add_node(TechnologyNode(
+            "Terraforming", 160,
+            {"Synthetic Ecology", "Industrialization"}, _terraforming,
+        ))
+        # Medicine track
+        t.add_node(TechnologyNode("Herbalism", 60, {"Botany"}, _herbalism))
+        t.add_node(TechnologyNode("Medicine", 80, {"Herbalism"}, _medicine))
+        t.add_node(TechnologyNode(
+            "Pharmacology", 100, {"Medicine", "Ecosystem Mapping"}, _pharmacology,
+        ))
+        t.add_node(TechnologyNode("Advanced Medicine", 110, {"Pharmacology"}, _advanced_medicine))
+        t.add_node(TechnologyNode(
+            "Genetic Medicine", 150,
+            {"Advanced Medicine", "Genetic Engineering"}, _genetic_medicine,
+        ))
+        # Genetics track
+        t.add_node(TechnologyNode("Cell Biology", 90, {"Medicine"}, _cell_biology))
+        t.add_node(TechnologyNode(
+            "Genetic Engineering", 130,
+            {"Cell Biology", "Pharmacology"}, _genetic_engineering,
+        ))
+        t.add_node(TechnologyNode("Synthetic Biology", 140, {"Genetic Engineering"}, _synthetic_biology))
+        t.add_node(TechnologyNode(
+            "Directed Evolution", 150,
+            {"Synthetic Biology", "Ecosystem Mapping"}, _directed_evolution,
+        ))
 
 
 # ---------------------------------------------------------------------------
