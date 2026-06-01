@@ -541,7 +541,7 @@ def launch_nuclear_strike(nation: "Nation", enemy: "Nation") -> None:
         casualties += int(enemy.population * 0.2 * damp)
 
     enemy.population = max(0, enemy.population - casualties)
-    enemy.economy_linear *= 0.3 * damp
+    enemy.economy_linear *= 1.0 - 0.7 * damp
     enemy.stability = max(0.0, enemy.stability - 40 * damp)
     nation.stability = max(0.0, nation.stability - 10)
 
@@ -554,6 +554,7 @@ def launch_nuclear_strike(nation: "Nation", enemy: "Nation") -> None:
 
 def launch_first_strike(nation: "Nation", enemies: List["Nation"]) -> None:
     """Launch all available warheads across ``enemies`` in round-robin fashion."""
+    enemies = [e for e in enemies if e is not nation]
     if nation.nuclear_stockpile <= 0 or not enemies:
         return
 
