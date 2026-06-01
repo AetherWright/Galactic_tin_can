@@ -1,8 +1,43 @@
+"""Three-subsystem technology architecture.
+
+This module replaces the single flat :class:`TechnologyTree` with a layered
+research model that mirrors the C# era design:
+
+* Three :class:`TechnologySubsystem` instances — :class:`PhysicsSubsystem`,
+  :class:`EngineeringSubsystem` and :class:`BiologySubsystem`.  Each owns its
+  own named technology graph, its own :class:`~worldsim.ai.ResearchAI` and its
+  own research-point pool.
+* A :class:`ResearchDirector` that receives the nation's total research points
+  each tick, allocates them between the subsystems and is aware of
+  cross-subsystem prerequisites.
+
+Design notes
+------------
+* **Output interface unchanged.**  Technologies still publish their effects
+  through ``nation.tech_bonuses`` exactly as before — every effect is a
+  first-class callable stored on the :class:`TechnologyNode`.
+* **FTL stays in ftl.py.**  :func:`~worldsim.models.ftl.add_ftl_tech_nodes` is
+  called against the engineering subsystem's graph; the drive prerequisites
+  ("Industrial Automation", "Atomic Engineering", "Nuclear Weapons") live in
+  the engineering / physics subsystems, so the FTL chain is gated across both
+  via the cross-subsystem prerequisite mechanism.  ftl.py is not modified.
+* **SpacecraftTechnology stays separate.**  As in the C# version, ship-class
+  technology (``ShipTemplate`` / ``SHIP_TEMPLATES`` in ``fleet.py``) is *not*
+  merged into the subsystems.  Only FTL propulsion — which is engineering —
+  lives here.
+* **Procedural generation is gated.**  Random technologies are only grown once
+  *all* of a subsystem's base technologies are unlocked, never continuously
+  while the hand-authored chain is still in progress.
+* The ``nation.tech_tree`` attribute now holds the :class:`ResearchDirector`.
+  It still quacks like the old tree (``.unlocked``, ``.nodes``, ``.research``)
+  so the rest of the simulation needs no changes.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import count
-from typing import Dict, Set, List, Optional
+from typing import Dict, List, Optional, Set
 
 import random
 
@@ -35,8 +70,10 @@ TECH_SUFFIXES = [
 
 _TECH_COUNTER = count()
 
+
 def _mult_bonus(n: "Nation", key: str, factor: float, cap: float = 5.0) -> None:
     n.tech_bonuses[key] = min(n.tech_bonuses.get(key, 1.0) * factor, cap)
+
 
 def generate_tech_name() -> str:
     """Return a unique technology name."""
@@ -70,6 +107,10 @@ def add_random_technologies(tree: "TechnologyTree", nation: "Nation", count: int
         tree.add_node(generate_random_technology(tree, nation))
 
 
+# ---------------------------------------------------------------------------
+# Coarse technology levels (unchanged — consumed by events / projects / war)
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class Technology:
     """More detailed technology levels."""
@@ -93,9 +134,17 @@ class Technology:
         return (self.science + self.military + self.industry) / 3
 
 
+# ---------------------------------------------------------------------------
+# Tech graph primitives
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class TechnologyNode:
-    """Node in a technology tree."""
+    """Node in a technology graph.
+
+    ``effect`` is a first-class callable invoked once when the node is
+    unlocked; it mutates ``nation.tech_bonuses`` (or the nation directly).
+    """
 
     name: str
     cost: float
@@ -105,7 +154,14 @@ class TechnologyNode:
 
 @dataclass(slots=True)
 class TechnologyTree:
-    """Collection of technologies to research."""
+    """A single subsystem's node graph plus its unlocked set and point pool.
+
+    The class is deliberately a thin container.  Availability can be resolved
+    against an *external* unlocked set so a subsystem graph can depend on
+    technologies unlocked in a sibling subsystem (cross-subsystem
+    prerequisites).  Allocation, AI selection and procedural growth all live on
+    :class:`TechnologySubsystem` / :class:`ResearchDirector`.
+    """
 
     nodes: Dict[str, TechnologyNode] = field(default_factory=dict)
     unlocked: Set[str] = field(default_factory=set)
@@ -114,100 +170,371 @@ class TechnologyTree:
     def add_node(self, node: TechnologyNode) -> None:
         self.nodes[node.name] = node
 
-    def available(self) -> List[TechnologyNode]:
-        return [n for n in self.nodes.values() if n.name not in self.unlocked and n.prerequisites <= self.unlocked]
+    def available(self, extra_unlocked: Optional[Set[str]] = None) -> List[TechnologyNode]:
+        """Return researchable nodes.
+
+        A node is researchable when it is not yet unlocked and all of its
+        prerequisites are satisfied by the union of this tree's unlocked set
+        and ``extra_unlocked`` (the rest of the nation's research).
+        """
+        if extra_unlocked is None:
+            visible = self.unlocked
+        else:
+            visible = self.unlocked | extra_unlocked
+        return [
+            n
+            for n in self.nodes.values()
+            if n.name not in self.unlocked and n.prerequisites <= visible
+        ]
 
     def research(self, points: float, nation: "Nation", ai: Optional["ResearchAI"] = None) -> None:
+        """Spend ``points`` greedily on this tree in isolation.
+
+        Retained for backwards compatibility / standalone use; the simulation
+        drives research through :class:`ResearchDirector` instead.  Selection
+        falls back to a cheapest-first heuristic — no AI state vector is
+        fabricated here.
+        """
         self.research_points += points
         options = self.available()
         while options and self.research_points >= min(n.cost for n in options):
-            if ai:
-                state = [
-                    nation.technology.science,
-                    nation.technology.military,
-                    nation.technology.industry,
-                    len(self.unlocked),
-                ]
-                idx = ai.choose_action(state)
-                idx = idx % len(options)
-                choice = options[idx]
-            else:
-                choice = options[0]
-            if self.research_points < choice.cost:
-                break
+            choice = min(options, key=lambda n: n.cost)
             self.research_points -= choice.cost
             self.unlocked.add(choice.name)
             if choice.effect:
                 choice.effect(nation)
-            # Dynamically grow the tech tree when research completes
-            add_random_technologies(self, nation, 1)
-            if nation.research_ai:
-                nation.research_ai.n_actions = len(self.nodes)
             options = self.available()
-            if ai:
-                new_state = [
-                    nation.technology.science,
-                    nation.technology.military,
-                    nation.technology.industry,
-                    len(self.unlocked),
-                ]
-                reward = nation.compute_reward("research", state, new_state)
-                ai.train(state, idx, reward, new_state)
+
+
+# ---------------------------------------------------------------------------
+# Subsystems
+# ---------------------------------------------------------------------------
+
+class TechnologySubsystem:
+    """One research domain: a node graph, a :class:`ResearchAI` and a pool.
+
+    Subclasses populate :attr:`tree` with their hand-authored named
+    technologies in :meth:`build_nodes`.  Cross-subsystem prerequisites are
+    resolved against the owning :class:`ResearchDirector`'s global unlocked set
+    via :meth:`global_unlocked`.
+    """
+
+    #: Human-readable subsystem name (also used as the AI table role suffix).
+    name: str = "subsystem"
+
+    def __init__(self) -> None:
+        self.tree = TechnologyTree()
+        self.ai: Optional[ResearchAI] = None
+        self.director: Optional["ResearchDirector"] = None
+        #: Names of the hand-authored (non-procedural) technologies.  Populated
+        #: by :meth:`finalize_bases` after the director has injected any extra
+        #: nodes (e.g. FTL).  Procedural growth is gated on all of these being
+        #: unlocked.
+        self.base_names: Set[str] = set()
+        #: Whether this subsystem may grow procedural nodes once its base graph
+        #: is fully unlocked.
+        self.allow_procedural: bool = True
+
+    # -- views -------------------------------------------------------------
+    @property
+    def unlocked(self) -> Set[str]:
+        return self.tree.unlocked
+
+    @property
+    def nodes(self) -> Dict[str, TechnologyNode]:
+        return self.tree.nodes
+
+    def global_unlocked(self) -> Set[str]:
+        """Return everything unlocked across the whole nation."""
+        if self.director is not None:
+            return self.director.unlocked
+        return self.tree.unlocked
+
+    def available(self) -> List[TechnologyNode]:
+        return self.tree.available(self.global_unlocked())
+
+    # -- construction hooks ------------------------------------------------
+    def build_nodes(self, nation: "Nation") -> None:
+        """Populate :attr:`tree` with named technologies.  Override me."""
+        raise NotImplementedError
+
+    def finalize_bases(self) -> None:
+        """Record the full base graph (called after all injection is done)."""
+        self.base_names = set(self.tree.nodes)
+
+    def attach_ai(self) -> None:
+        """Create this subsystem's :class:`ResearchAI`.
+
+        # TODO: Aether — AI architecture parameters (input dimensionality and
+        # hidden-layer topology) per subsystem.  We currently construct the AI
+        # with the number of researchable nodes as the action count and rely on
+        # ``ResearchAI``'s own default ``n_inputs`` / ``hidden_layers`` — these
+        # defaults are placeholders, not tuned values.  An empty subsystem gets
+        # no AI (selection is a no-op / heuristic until nodes exist).
+        """
+        n_actions = len(self.tree.nodes)
+        if n_actions <= 0:
+            self.ai = None
+            return
+        self.ai = ResearchAI(n_actions)
+
+    # -- per-tick research -------------------------------------------------
+    def _build_state(self, nation: "Nation") -> Optional[List[float]]:
+        """Return the AI state vector for technology selection.
+
+        # TODO: Aether — define the state-vector contents for this subsystem's
+        # ResearchAI (e.g. counts of unlocked nodes, pending prerequisites,
+        # relevant nation metrics, current bonus levels).  Returning ``None``
+        # makes :meth:`research` fall back to the deterministic cheapest-first
+        # heuristic so that no state values are fabricated here.
+        """
+        return None
+
+    def research(self, points: float, nation: "Nation") -> None:
+        """Add ``points`` to the pool and unlock as many techs as affordable."""
+        self.tree.research_points += points
+        options = self.available()
+        while options and self.tree.research_points >= min(n.cost for n in options):
+            state = self._build_state(nation)
+            if self.ai is not None and state is not None:
+                idx = self.ai.choose_action(state) % len(options)
+                choice = options[idx]
+                # # TODO: Aether — train the subsystem ResearchAI here
+                # # (reward shaping + new-state vector once _build_state is real).
+            else:
+                choice = min(options, key=lambda n: n.cost)
+            if self.tree.research_points < choice.cost:
+                break
+            self.tree.research_points -= choice.cost
+            self.tree.unlocked.add(choice.name)
+            if choice.effect:
+                choice.effect(nation)
+            self._maybe_grow(nation)
+            options = self.available()
+
+    def _maybe_grow(self, nation: "Nation") -> None:
+        """Grow a procedural node, but only after the base graph is complete."""
+        if not self.allow_procedural or not self.base_names:
+            return
+        if not self.base_names <= self.tree.unlocked:
+            return
+        add_random_technologies(self.tree, nation, 1)
+        if self.ai is not None:
+            self.ai.n_actions = len(self.tree.nodes)
+
+
+# ---------------------------------------------------------------------------
+# Effect helpers shared by the hand-authored civilization chain
+# ---------------------------------------------------------------------------
+# Effects remain first-class callables on the nodes and publish exclusively
+# through ``nation.tech_bonuses`` (the unchanged output interface).
+
+def _city_output(n: "Nation") -> None:
+    n.tech_bonuses["city_output"] = n.tech_bonuses.get("city_output", 1.0) * 1.1
+
+
+def _admin(n: "Nation") -> None:
+    n.tech_bonuses["economy_mult"] = n.tech_bonuses.get("economy_mult", 1.0) * 1.1
+
+
+def _math_admin(n: "Nation") -> None:
+    n.tech_bonuses["economy_mult"] = n.tech_bonuses.get("economy_mult", 1.0) * 1.05
+
+
+def _factory(n: "Nation") -> None:
+    n.tech_bonuses["factory_output"] = n.tech_bonuses.get("factory_output", 1.0) * 1.1
+
+
+def _factory_major(n: "Nation") -> None:
+    n.tech_bonuses["factory_output"] = n.tech_bonuses.get("factory_output", 1.0) * 1.2
+
+
+def _mine_output(n: "Nation") -> None:
+    n.tech_bonuses["mine_output"] = n.tech_bonuses.get("mine_output", 1.0) * 1.1
+
+
+def _atomic(n: "Nation") -> None:
+    n.tech_bonuses["nuclear_prod"] = 1.0
+
+
+def _nuclear(n: "Nation") -> None:
+    n.tech_bonuses["nuclear_power"] = 1.0
+
+
+class PhysicsSubsystem(TechnologySubsystem):
+    """Fundamental science: the theoretical half of the civilization chain.
+
+    Holds the abstract advances that gate applied engineering work.  The chain
+    zig-zags across physics and engineering, demonstrating cross-subsystem
+    prerequisites (e.g. "Mathematics" here requires "Writing" from engineering).
+    """
+
+    name = "physics"
+
+    def build_nodes(self, nation: "Nation") -> None:
+        t = self.tree
+        # Civilization progression chain (physics portion).  Prerequisites that
+        # name engineering technologies are resolved against the global
+        # unlocked set by the director.
+        t.add_node(TechnologyNode("Mathematics", 60, {"Writing"}, _math_admin))
+        t.add_node(TechnologyNode("Material Science", 80, {"Engineering"}, _mine_output))
+        t.add_node(TechnologyNode("Atomic Engineering", 120, {"Industrialization"}, _atomic))
+        # # TODO: Aether — additional physics technologies and their effects
+        # # beyond the civilization progression chain (e.g. field theory,
+        # # particle physics, exotic-matter research).
+
+
+class EngineeringSubsystem(TechnologySubsystem):
+    """Applied construction: the practical half of the civilization chain.
+
+    Also the home of FTL propulsion, injected by the director through
+    :func:`~worldsim.models.ftl.add_ftl_tech_nodes`.
+    """
+
+    name = "engineering"
+
+    def build_nodes(self, nation: "Nation") -> None:
+        t = self.tree
+        # Civilization progression chain (engineering portion).
+        t.add_node(TechnologyNode("Agriculture", 50, effect=_city_output))
+        t.add_node(TechnologyNode("Writing", 55, {"Agriculture"}, _admin))
+        t.add_node(TechnologyNode("Engineering", 70, {"Mathematics"}, _factory))
+        t.add_node(TechnologyNode("Industrialization", 90, {"Material Science"}, _factory_major))
+        # Required by ftl.py prerequisites + war/events code.  Kept under their
+        # original names so the FTL chain and "Nuclear Weapons" / "Atomic
+        # Engineering" checks elsewhere continue to resolve.
+        t.add_node(TechnologyNode("Industrial Automation", 80, {"Industrialization"}, _factory))
+        t.add_node(TechnologyNode("Nuclear Weapons", 150, {"Atomic Engineering"}, _nuclear))
+        # # TODO: Aether — additional engineering technologies and their effects
+        # # beyond the civilization progression chain (e.g. military tactics,
+        # # weaponry, armored doctrine, shipbuilding for ports).
+
+
+class BiologySubsystem(TechnologySubsystem):
+    """Life sciences: medicine, agronomy, genetics.
+
+    Distinct from the physics/engineering civilization chain.  Its concrete
+    technology catalogue is intentionally left for design.
+    """
+
+    name = "biology"
+
+    def build_nodes(self, nation: "Nation") -> None:
+        # # TODO: Aether — biology technology names and effects (e.g. medicine →
+        # # ``plague_resist``, genetics, terraforming, life-support).  Until
+        # # populated this subsystem has no researchable nodes, so the director
+        # # will simply not allocate effective research to it.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Research director
+# ---------------------------------------------------------------------------
+
+class ResearchDirector:
+    """Owns the three subsystems and allocates research points between them.
+
+    Exposes the legacy ``TechnologyTree`` surface (``unlocked`` / ``nodes`` /
+    ``research``) so the rest of the simulation can treat ``nation.tech_tree``
+    unchanged.
+    """
+
+    def __init__(self, nation: "Nation") -> None:
+        self.physics = PhysicsSubsystem()
+        self.engineering = EngineeringSubsystem()
+        self.biology = BiologySubsystem()
+        self.subsystems: List[TechnologySubsystem] = [
+            self.physics,
+            self.engineering,
+            self.biology,
+        ]
+        for sub in self.subsystems:
+            sub.director = self
+            sub.build_nodes(nation)
+
+        # Inject FTL drives into the engineering subsystem's graph.  The drive
+        # prerequisites span engineering ("Industrial Automation", "Nuclear
+        # Weapons") and physics ("Atomic Engineering"), so the FTL chain is
+        # gated across both subsystems through cross-subsystem prerequisites.
+        # ftl.py is not modified.  Spacecraft / ship-class technology remains
+        # separate (see fleet.py) and is deliberately NOT added here.
+        from .ftl import add_ftl_tech_nodes
+        add_ftl_tech_nodes(self.engineering.tree, nation)
+
+        # Lock in the base graphs (incl. injected FTL nodes) and build AIs.
+        for sub in self.subsystems:
+            sub.finalize_bases()
+            sub.attach_ai()
+
+        #: Director-level allocation policy.
+        # # TODO: Aether — director allocation strategy.  Optionally drive this
+        # # with a dedicated allocation AI (a ResearchAI over the three
+        # # subsystems, or a learned policy keyed on cross-subsystem demand).
+        # # The default below is a transparent heuristic.
+        self.allocation_ai: Optional[ResearchAI] = None
+
+        #: Cross-subsystem dependency graph beyond the civilization chain.
+        # # TODO: Aether — declare which physics technologies gate which
+        # # engineering (or biology) technologies, beyond the hand-wired
+        # # prerequisites already on the civilization-chain nodes.  Format e.g.
+        # # ``{"Field Theory": {"Antimatter Containment"}}``.  These would be
+        # # merged into the relevant node prerequisites at build time.
+        self.cross_subsystem_prereqs: Dict[str, Set[str]] = {}
+
+        self.total_points: float = 0.0
+
+    # -- legacy TechnologyTree surface ------------------------------------
+    @property
+    def unlocked(self) -> Set[str]:
+        """Union of every subsystem's unlocked technologies."""
+        out: Set[str] = set()
+        for sub in self.subsystems:
+            out |= sub.tree.unlocked
+        return out
+
+    @property
+    def nodes(self) -> Dict[str, TechnologyNode]:
+        """Merged view of every subsystem's nodes."""
+        out: Dict[str, TechnologyNode] = {}
+        for sub in self.subsystems:
+            out.update(sub.tree.nodes)
+        return out
+
+    # -- allocation --------------------------------------------------------
+    def research(
+        self, points: float, nation: "Nation", ai: Optional["ResearchAI"] = None
+    ) -> None:
+        """Allocate ``points`` across the subsystems and run their research.
+
+        ``ai`` is accepted for signature compatibility with the old
+        ``TechnologyTree.research`` call (``nation.research_ai``) but is not
+        used for allocation by default — see the ``allocation_ai`` TODO.
+        """
+        self.total_points += points
+        if points <= 0:
+            return
+
+        # # TODO: Aether — replace this equal-split heuristic with the real
+        # # allocation strategy (priority weighting, demand-aware splitting,
+        # # or allocation_ai-driven choice).  For now: split the tick's points
+        # # evenly between subsystems that currently have researchable techs so
+        # # idle subsystems (e.g. an unpopulated biology graph) don't waste the
+        # # nation's research output.
+        active = [sub for sub in self.subsystems if sub.available()]
+        if not active:
+            # Everything currently researchable is done; keep feeding all
+            # subsystems so their pools build and procedural growth can proceed.
+            active = self.subsystems
+
+        share = points / len(active)
+        for sub in active:
+            sub.research(share, nation)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def setup_default_tech_tree(nation: "Nation") -> None:
-    """Populate a basic tech tree for ``nation``."""
-
-    tree = TechnologyTree()
-
-    def mining_bonus(n: "Nation") -> None:
-        n.tech_bonuses["mine_output"] = n.tech_bonuses.get("mine_output", 1.0) * 1.1
-
-    def farming_bonus(n: "Nation") -> None:
-        n.tech_bonuses["city_output"] = n.tech_bonuses.get("city_output", 1.0) * 1.1
-
-    def medical_bonus(n: "Nation") -> None:
-        n.tech_bonuses["plague_resist"] = n.tech_bonuses.get("plague_resist", 0.0) + 0.2
-
-    def tactics_bonus(n: "Nation") -> None:
-        _mult_bonus(n, "division_power", 1.1, cap=5.0)
-
-    def weapons_bonus(n: "Nation") -> None:
-        _mult_bonus(n, "division_power", 1.2, cap=5.0)
-
-    def ship_bonus(n: "Nation") -> None:
-        n.tech_bonuses["port_bonus"] = n.tech_bonuses.get("port_bonus", 1.0) * 1.1
-
-    def admin_bonus(n: "Nation") -> None:
-        n.tech_bonuses["economy_mult"] = n.tech_bonuses.get("economy_mult", 1.0) * 1.1
-
-    def industry_bonus(n: "Nation") -> None:
-        n.tech_bonuses["factory_output"] = n.tech_bonuses.get("factory_output", 1.0) * 1.1
-
-    def armored_unit(n: "Nation") -> None:
-        n.division_templates["Armored"] = DivisionTemplate("Armored", 600, 1.5, 1.0)
-
-    def atomic_bonus(n: "Nation") -> None:
-        n.tech_bonuses["nuclear_prod"] = 1.0
-
-    def nuclear_weapon(n: "Nation") -> None:
-        n.tech_bonuses["nuclear_power"] = 1.0
-
-    tree.add_node(TechnologyNode("Improved Mining", 50, effect=mining_bonus))
-    tree.add_node(TechnologyNode("Advanced Agriculture", 50, effect=farming_bonus))
-    tree.add_node(TechnologyNode("Medical Knowledge", 60, effect=medical_bonus))
-    tree.add_node(TechnologyNode("Military Tactics", 70, {"Medical Knowledge"}, tactics_bonus))
-    tree.add_node(TechnologyNode("Shipbuilding", 70, effect=ship_bonus))
-    tree.add_node(TechnologyNode("Efficient Administration", 70, effect=admin_bonus))
-    tree.add_node(TechnologyNode("Improved Weaponry", 80, {"Military Tactics"}, weapons_bonus))
-    tree.add_node(TechnologyNode("Industrial Automation", 80, {"Improved Mining"}, industry_bonus))
-    tree.add_node(TechnologyNode("Armored Warfare", 100, {"Improved Weaponry"}, armored_unit))
-    tree.add_node(TechnologyNode("Atomic Engineering", 120, {"Industrial Automation"}, atomic_bonus))
-    tree.add_node(TechnologyNode("Nuclear Weapons", 150, {"Atomic Engineering", "Improved Weaponry"}, nuclear_weapon))
-
-    # Add a few randomised technologies so each nation differs slightly
-    add_random_technologies(tree, nation)
-
-    # Inject FTL drive nodes so the full interstellar tech chain is available
-    from .ftl import add_ftl_tech_nodes
-    add_ftl_tech_nodes(tree, nation)
-
-    nation.tech_tree = tree
+    """Install a :class:`ResearchDirector` on ``nation`` as its tech tree."""
+    nation.tech_tree = ResearchDirector(nation)
