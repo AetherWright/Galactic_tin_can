@@ -514,21 +514,27 @@ class ResearchDirector:
         if points <= 0:
             return
 
-        # # TODO: Aether — replace this equal-split heuristic with the real
-        # # allocation strategy (priority weighting, demand-aware splitting,
-        # # or allocation_ai-driven choice).  For now: split the tick's points
-        # # evenly between subsystems that currently have researchable techs so
-        # # idle subsystems (e.g. an unpopulated biology graph) don't waste the
-        # # nation's research output.
-        active = [sub for sub in self.subsystems if sub.available()]
+        # # TODO: Aether — replace this heuristic with the real allocation
+        # # strategy (priority weighting, demand-aware splitting, or
+        # # allocation_ai-driven choice).  For now: distribute the tick's points
+        # # across subsystems weighted by how many technologies each can
+        # # currently research, so subsystems with more open work receive
+        # # proportionally more.  Idle subsystems (e.g. an unpopulated biology
+        # # graph) get nothing while others have researchable techs.
+        researchable = [(sub, sub.available()) for sub in self.subsystems]
+        active = [(sub, avail) for sub, avail in researchable if avail]
         if not active:
             # Everything currently researchable is done; keep feeding all
-            # subsystems so their pools build and procedural growth can proceed.
-            active = self.subsystems
+            # subsystems evenly so their pools build and procedural growth can
+            # proceed.
+            share = points / len(self.subsystems)
+            for sub in self.subsystems:
+                sub.research(share, nation)
+            return
 
-        share = points / len(active)
-        for sub in active:
-            sub.research(share, nation)
+        total = sum(len(avail) for _, avail in active)
+        for sub, avail in active:
+            sub.research(points * len(avail) / total, nation)
 
 
 # ---------------------------------------------------------------------------

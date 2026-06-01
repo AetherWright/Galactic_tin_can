@@ -118,13 +118,19 @@ def _apply_civilian_ai(nation: "Nation") -> None:
 
 
 def process_action_queue(nation: "Nation", limit: int = 2) -> None:
-    for _ in range(min(limit, len(nation.action_queue))):
+    # Re-check the queue each iteration rather than pre-computing the count:
+    # _execute_civilian_action may itself enqueue further actions, so a stale
+    # length could skip items or pop from an exhausted queue.  We process at
+    # most ``limit`` actions per call regardless of mid-loop growth.
+    processed = 0
+    while nation.action_queue and processed < limit:
         idx = nation.action_queue.pop(0)
         state = _civilian_state(nation)
         _execute_civilian_action(nation, idx)
         new_state = _civilian_state(nation)
         reward = nation.compute_reward("civilian", state, new_state)
         nation.civilian_ai.train(state, idx, reward, new_state)
+        processed += 1
 
 
 def _random_civilian_actions(
@@ -160,7 +166,8 @@ def _random_civilian_actions(
 
     if nation.civilian_ai is not None:
         state = _civilian_state(nation)
-        idx = nation.civilian_ai.choose_action(state)
+        valid_mask = _valid_action_mask(nation)
+        idx = nation.civilian_ai.choose_action(state, valid_mask)
         _execute_civilian_action(nation, idx)
         new_state = _civilian_state(nation)
         reward = nation.compute_reward("civilian", state, new_state)

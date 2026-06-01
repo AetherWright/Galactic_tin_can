@@ -90,7 +90,6 @@ def build_base(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.bases:
-        nation.spend_resources(cost)
         return
     base = MilitaryBase(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_base(base)
@@ -107,7 +106,6 @@ def build_mine(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.mines:
-        nation.spend_resources(cost)
         return
     mine = Mine(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_mine(mine)
@@ -124,7 +122,6 @@ def build_port(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.ports:
-        nation.spend_resources(cost)
         return
     port = Port(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_port(port)
@@ -141,7 +138,6 @@ def build_factory(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.factories:
-        nation.spend_resources(cost)
         return
     fac = Factory(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_factory(fac)
@@ -158,7 +154,6 @@ def build_hospital(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.hospitals:
-        nation.spend_resources(cost)
         return
     hos = Hospital(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_hospital(hos)
@@ -175,7 +170,6 @@ def build_shipyard(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.shipyards:
-        nation.spend_resources(cost)
         return
     yard = Shipyard(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_shipyard(yard)
@@ -192,7 +186,6 @@ def build_school(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.schools:
-        nation.spend_resources(cost)
         return
     school = School(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_school(school)
@@ -209,7 +202,6 @@ def build_power_plant(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.power_plants:
-        nation.spend_resources(cost)
         return
     plant = PowerPlant(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_power_plant(plant)
@@ -226,7 +218,6 @@ def build_lab(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.labs:
-        nation.spend_resources(cost)
         return
     lab = ResearchLab(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_lab(lab)
@@ -243,7 +234,6 @@ def build_nuke_facility(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.nuke_plants:
-        nation.spend_resources(cost)
         return
     fac = NuclearFacility(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_nuke_facility(fac)
@@ -260,7 +250,6 @@ def build_orbital_defense(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.orbital_defenses:
-        nation.spend_resources(cost)
         return
     od = OrbitalDefense(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_orbital_defense(od)
@@ -277,7 +266,6 @@ def build_spaceport(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.spaceports:
-        nation.spend_resources(cost)
         return
     port = Spaceport(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_spaceport(port)
