@@ -238,23 +238,62 @@ class Nation:
     def _init_ai_controllers(self, ally_dim: int) -> None:
         if self.ai_table_dir is not None and not isinstance(self.ai_table_dir, Path):
             self.ai_table_dir = Path(self.ai_table_dir)
-        military_path = self._ai_table_path("military")
-        civilian_path = self._ai_table_path("civilian")
-        project_path = self._ai_table_path("projects")
+        military_path  = self._ai_table_path("military")
+        civilian_path  = self._ai_table_path("civilian")
+        project_path   = self._ai_table_path("projects")
         diplomacy_path = self._ai_table_path("diplomacy")
-        research_path = self._ai_table_path("research")
-        self.military_ai = WarAI(allies_dim=ally_dim, table_path=military_path)
-        self.civilian_ai = DomesticPolicyAI(21,n_inputs=20,hidden_layers=(32, 24, 16, 10, 8, 7, 7, 8, 10, 16, 24, 32),table_path=civilian_path,)
-        self.project_ai = ProjectAI(
-            len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
-        )
-        self.diplomacy_ai = DiplomacyAI(3, n_inputs=5, table_path=diplomacy_path)
-        self.research_ai = ResearchAI(
-            len(self.tech_tree.nodes), n_inputs=4, table_path=research_path
-        )
-        # DoctrineAI runs AFTER civilian and diplomacy AIs each fifth
-        doctrine_path = self._ai_table_path("doctrine")
-        self.doctrine_ai = DoctrineAI(table_path=doctrine_path)
+        research_path  = self._ai_table_path("research")
+        doctrine_path  = self._ai_table_path("doctrine")
+
+        # Prefer the PyTorch RNN backend when available; fall back to the
+        # hand-rolled Nelder-Mead controllers otherwise.
+        try:
+            from ..torch_rnn import (
+                rnn_available,
+                TorchWarAI,
+                TorchDomesticPolicyAI,
+                TorchProjectAI,
+                TorchDiplomacyAI,
+                TorchResearchAI,
+                TorchDoctrineAI,
+            )
+            _use_torch = rnn_available()
+        except Exception:  # ImportError or anything else
+            _use_torch = False
+
+        if _use_torch:
+            self.military_ai  = TorchWarAI(
+                allies_dim=ally_dim, table_path=military_path
+            )
+            self.civilian_ai  = TorchDomesticPolicyAI(
+                21, n_inputs=20, table_path=civilian_path
+            )
+            self.project_ai   = TorchProjectAI(
+                len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
+            )
+            self.diplomacy_ai = TorchDiplomacyAI(
+                3, n_inputs=5, table_path=diplomacy_path
+            )
+            self.research_ai  = TorchResearchAI(
+                len(self.tech_tree.nodes), n_inputs=4, table_path=research_path
+            )
+            self.doctrine_ai  = TorchDoctrineAI(table_path=doctrine_path)
+        else:
+            self.military_ai  = WarAI(allies_dim=ally_dim, table_path=military_path)
+            self.civilian_ai  = DomesticPolicyAI(
+                21, n_inputs=20,
+                hidden_layers=(32, 24, 16, 10, 8, 7, 7, 8, 10, 16, 24, 32),
+                table_path=civilian_path,
+            )
+            self.project_ai   = ProjectAI(
+                len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
+            )
+            self.diplomacy_ai = DiplomacyAI(3, n_inputs=5, table_path=diplomacy_path)
+            self.research_ai  = ResearchAI(
+                len(self.tech_tree.nodes), n_inputs=4, table_path=research_path
+            )
+            # DoctrineAI runs AFTER civilian and diplomacy AIs each fifth
+            self.doctrine_ai  = DoctrineAI(table_path=doctrine_path)
 
     # ------------------------------------------------------------------
     # Economy proxies
@@ -368,15 +407,31 @@ class Nation:
     def compute_reward(
         self, task: str, state: List[float], new_state: List[float]
     ) -> float:
-        """Return weighted reward for *task* based on meta-learning."""
+        """Return weighted reward for *task* based on meta-learning.
+
+        The raw reward is the dot product of the active MetaGA genome's
+        weight vector with the per-feature state delta.  A small goal-
+        progress bonus is added on top so the RL signal explicitly rewards
+        progress toward the nation's current objectives, tightening the
+        feedback loop between the GA-level goal setting and the RL policy.
+        """
         diff = [n - s for n, s in zip(new_state, state)]
         ga = self.reward_ga.get(task)
         if ga:
             weights = ga.weights
             if len(weights) < len(diff):
                 weights = weights + [1.0] * (len(diff) - len(weights))
-            return sum(w * d for w, d in zip(weights, diff))
-        return sum(diff)
+            base_reward = sum(w * d for w, d in zip(weights, diff))
+        else:
+            base_reward = sum(diff)
+
+        # Goal-progress bonus: nudge the policy toward active objectives.
+        # progress() is O(1) per goal (pure arithmetic on nation attributes).
+        goal_bonus = sum(
+            g.progress(self) * g.priority for g in self.goals.active()
+        ) * 0.01
+
+        return base_reward + goal_bonus
 
     def step_meta(self, year: int) -> None:
         self.current_year = year
@@ -388,6 +443,23 @@ class Nation:
         self.leader_model.evolve()
         self.leader = self.leader_model.generate(self)
         self.last_collapse = self.current_year
+        # Mutate LoRA + reset optimizers for every RNN controller so the
+        # behaviour space is explored alongside the new genome's reward
+        # weighting.  Silent failure when torch is absent or controllers
+        # are the legacy NelderMead type.
+        try:
+            from ..torch_rnn import RNNController
+            _CTRL_ATTRS = (
+                "civilian_ai", "military_ai", "project_ai",
+                "diplomacy_ai", "research_ai", "doctrine_ai",
+            )
+            for attr in _CTRL_ATTRS:
+                ctrl = getattr(self, attr, None)
+                if isinstance(ctrl, RNNController):
+                    ctrl.mutate_lora(sigma=0.02)
+                    ctrl.reset_lora_optimizer()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Idea helpers
@@ -492,19 +564,52 @@ class Nation:
         plague_res = self.tech_bonuses.get("plague_resist", 0.0)
         gov_bonuses = self.government.bonuses()
         planet = PLANETS.get(self.planet)
-        plague_level = planet.plague_level if planet else 0.0
+        plague_level    = planet.plague_level    if planet else 0.0
         radiation_level = planet.radiation_level if planet else 0.0
         cbonus = self.tech_bonuses.get("city_output", 1.0)
+
+        # Infrastructure investment health: how much the nation can afford to
+        # invest in city upkeep relative to its city count.  Normalised to 1.0
+        # meaning "fully funded" (economy_linear ≥ 50 per city).
+        econ_health = min(
+            1.0,
+            self.economy_linear / max(1.0, len(self.cities) * 50.0)
+        ) if self.cities else 0.3
+
         pop, econ = process_city_batch(
             self.cities, plague_level, radiation_level, plague_res, cbonus,
             self.tech_bonuses.get("pop_growth", 1.0),   # biology: Pharmacology
             self.tech_bonuses.get("pop_cap", 1.0),      # biology: Genetic Engineering
+            stability=self.stability,
+            hospital_count=len(self.hospitals),
+            econ_health=econ_health,
         )
         total_pop += pop
         total_econ += econ
+
+        # Rural migration: pull rural residents into cities with spare capacity.
+        from ..planets.city import process_rural_migration
+        process_rural_migration(self.cities)
+
         if self.colonies:
-            cpop = process_colony_batch(self.colonies, plague_level, plague_res)
+            cpop = process_colony_batch(
+                self.colonies, plague_level, plague_res,
+                stability=self.stability,
+            )
             total_pop += cpop
+
+        # Rural population dynamics for owned counties on the home planet.
+        if planet is not None:
+            food_ratio = min(
+                1.0,
+                planet.resources.get('food', 50.0) / 50.0,
+            )
+            for county in planet.counties.values():
+                if county.owner == self.id:
+                    county.process_rural_turn(
+                        food_ratio=food_ratio,
+                        stability=self.stability,
+                    )
         if _np is not None:
             if self.mines:
                 arr = _np.array([m.output for m in self.mines], dtype=float)

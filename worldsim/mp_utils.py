@@ -4,7 +4,14 @@ from multiprocessing.pool import Pool as _Pool
 from typing import Iterable, Callable, Any, Literal
 from concurrent.futures import ThreadPoolExecutor
 
-_USE_MP = bool(int(os.getenv("WORLDSIM_USE_MP", "0")))
+# Enable multiprocessing by default; set WORLDSIM_USE_MP=0 to disable.
+_USE_MP = bool(int(os.getenv("WORLDSIM_USE_MP", "1")))
+
+# Number of worker processes/threads.  Defaults to the logical CPU count;
+# override with WORLDSIM_NUM_WORKERS.
+_CPU_COUNT = max(1, _mp.cpu_count() or 1)
+_NUM_WORKERS = int(os.getenv("WORLDSIM_NUM_WORKERS", str(_CPU_COUNT)))
+
 _POOL: _Pool | None = None
 _THREAD_POOL: ThreadPoolExecutor | None = None
 
@@ -14,7 +21,7 @@ def _get_pool() -> _Pool | None:
     if not _USE_MP:
         return None
     if _POOL is None:
-        _POOL = _mp.Pool()
+        _POOL = _mp.Pool(processes=_NUM_WORKERS)
     return _POOL
 
 
@@ -58,7 +65,7 @@ def pooled_map(
     # Thread mode -----------------------------------------------------
     global _THREAD_POOL
     if _THREAD_POOL is None:
-        _THREAD_POOL = ThreadPoolExecutor()
+        _THREAD_POOL = ThreadPoolExecutor(max_workers=_NUM_WORKERS)
     futures = [_THREAD_POOL.submit(func, x) for x in items]
     return [future.result() for future in futures]
 
