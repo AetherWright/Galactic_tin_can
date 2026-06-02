@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Simulation runtime outputs
+sim_log.jsonl
+# Only ignore the auto-generated default table, not the event-specific seeds
+events_q_table.yml
+
+# Compiled native extensions (rebuilt automatically on first run)
+worldsim/cpp_utils/libcpp_utils.so
+worldsim/rust_*/target/
