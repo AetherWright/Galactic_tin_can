@@ -75,8 +75,9 @@ def _execute_civilian_action(nation: "Nation", idx: int) -> None:
 def _valid_action_mask(nation: "Nation") -> List[bool]:
     has_nuke_tech = "Nuclear Weapons" in nation.tech_tree.unlocked
     has_shipyard = len(nation.shipyards) > 0
-    has_spaceport = bool(nation.spaceports) if hasattr(nation, "spaceports") else False
-    can_colonize = has_spaceport and nation.star_count < len([s for s in STARS.values() if s.owner is None])
+    # colonize_planet() itself has no spaceport guard — mask only on available
+    # free stars so the action is suppressed when there is nowhere to go.
+    can_colonize = nation.star_count < len([s for s in STARS.values() if s.owner is None])
 
     return [
         True,           # build_city

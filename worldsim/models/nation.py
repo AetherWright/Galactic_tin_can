@@ -138,8 +138,8 @@ __all_message__ = ["Message"]
 
 
 
-# NationalProject, ProjectSpec, PROJECT_CATALOG, PROJECT_NAMES, RESOURCE_COSTS
-# are defined in government.py and re-exported above.
+# NationalProject, ProjectSpec, PROJECT_CATALOG, PROJECT_NAMES are defined in
+# projects.py; RESOURCE_COSTS is defined in infrastructure.py.
 
 
 @dataclass(slots=True)

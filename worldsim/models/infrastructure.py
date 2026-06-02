@@ -61,6 +61,17 @@ def collect_resources(nation: "Nation") -> None:
 # Build methods
 # ---------------------------------------------------------------------------
 
+def _upgrade_at_anchor(nation: "Nation", owned: list, ax: int, ay: int, cost) -> None:
+    """Upgrade the nation's own structure at (ax, ay) and spend resources.
+
+    Called when a build_ function detects the target coord is already occupied.
+    If the slot belongs to another nation nothing happens (no spend, no upgrade).
+    """
+    existing = next((s for s in owned if s.x == ax and s.y == ay), None)
+    if existing:
+        existing.upgrade()
+        nation.spend_resources(cost)
+
 def build_city(nation: "Nation") -> None:
     planet = PLANETS.get(nation.planet)
     if not planet:
@@ -92,6 +103,7 @@ def build_base(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.bases:
+        _upgrade_at_anchor(nation, nation.bases, anchor.x, anchor.y, cost)
         return
     base = MilitaryBase(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_base(base)
@@ -108,6 +120,7 @@ def build_mine(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.mines:
+        _upgrade_at_anchor(nation, nation.mines, anchor.x, anchor.y, cost)
         return
     mine = Mine(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_mine(mine)
@@ -124,6 +137,7 @@ def build_port(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.ports:
+        _upgrade_at_anchor(nation, nation.ports, anchor.x, anchor.y, cost)
         return
     port = Port(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_port(port)
@@ -140,6 +154,7 @@ def build_factory(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.factories:
+        _upgrade_at_anchor(nation, nation.factories, anchor.x, anchor.y, cost)
         return
     fac = Factory(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_factory(fac)
@@ -156,6 +171,7 @@ def build_hospital(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.hospitals:
+        _upgrade_at_anchor(nation, nation.hospitals, anchor.x, anchor.y, cost)
         return
     hos = Hospital(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_hospital(hos)
@@ -172,6 +188,7 @@ def build_shipyard(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.shipyards:
+        _upgrade_at_anchor(nation, nation.shipyards, anchor.x, anchor.y, cost)
         return
     yard = Shipyard(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_shipyard(yard)
@@ -188,6 +205,7 @@ def build_school(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.schools:
+        _upgrade_at_anchor(nation, nation.schools, anchor.x, anchor.y, cost)
         return
     school = School(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_school(school)
@@ -204,6 +222,7 @@ def build_power_plant(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.power_plants:
+        _upgrade_at_anchor(nation, nation.power_plants, anchor.x, anchor.y, cost)
         return
     plant = PowerPlant(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_power_plant(plant)
@@ -220,6 +239,7 @@ def build_lab(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.labs:
+        _upgrade_at_anchor(nation, nation.labs, anchor.x, anchor.y, cost)
         return
     lab = ResearchLab(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_lab(lab)
@@ -236,6 +256,7 @@ def build_nuke_facility(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.nuke_plants:
+        _upgrade_at_anchor(nation, nation.nuke_plants, anchor.x, anchor.y, cost)
         return
     fac = NuclearFacility(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_nuke_facility(fac)
@@ -252,6 +273,7 @@ def build_orbital_defense(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.orbital_defenses:
+        _upgrade_at_anchor(nation, nation.orbital_defenses, anchor.x, anchor.y, cost)
         return
     od = OrbitalDefense(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_orbital_defense(od)
@@ -268,6 +290,7 @@ def build_spaceport(nation: "Nation") -> None:
         return
     anchor = max(nation.cities, key=lambda c: c.population)
     if (anchor.x, anchor.y) in planet.spaceports:
+        _upgrade_at_anchor(nation, nation.spaceports, anchor.x, anchor.y, cost)
         return
     port = Spaceport(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_spaceport(port)
