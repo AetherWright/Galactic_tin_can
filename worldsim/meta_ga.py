@@ -26,9 +26,10 @@ class RewardGA:
     def weights(self) -> List[float]:
         return self.population[self.active].weights
 
-    def step(self) -> None:
+    
+    def step(self, score) -> None:
         """Increment fitness for the active genome."""
-        self.population[self.active].fitness += 1
+        self.population[self.active].fitness += score
 
     def evolve(self) -> None:
         """Breed new genomes from the fittest two."""
