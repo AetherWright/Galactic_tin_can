@@ -435,7 +435,7 @@ class Nation:
 
     def step_meta(self, year: int) -> None:
         self.current_year = year
-        self.leader_model.step(1)
+        self.leader_model.step()
 
     def evolve_meta(self) -> None:
         for ga in self.reward_ga.values():
