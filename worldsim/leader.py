@@ -51,7 +51,7 @@ class LeaderModel:
         return Leader(name, result)
 
     def step(self) -> None:
-        self.ga.step()
+        self.ga.step(1)
 
     def evolve(self) -> None:
         self.ga.evolve()
