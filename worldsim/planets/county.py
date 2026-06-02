@@ -7,6 +7,14 @@ if TYPE_CHECKING:
     from .city import City
 from ..ideas import Idea
 
+
+# Rural demographic constants (lower rates than urban; less healthcare access).
+_RURAL_BASE_BIRTH: float = 0.020   # per turn (~1 % per 20-year period)
+_RURAL_BASE_DEATH: float = 0.013   # slightly higher natural mortality than cities
+_RURAL_STARVE_THRESH: float = 0.40 # food_ratio below which starvation sets in
+_RURAL_STARVE_MAX: float   = 0.06  # maximum starvation mortality
+
+
 @dataclass
 class County:
     """Simple territorial division containing multiple cities.
@@ -47,3 +55,38 @@ class County:
         if not self.ideas:
             return None
         return max(self.ideas.values(), key=lambda i: i.followers).name
+
+    def process_rural_turn(
+        self,
+        food_ratio: float = 1.0,
+        stability: float = 75.0,
+    ) -> None:
+        """Advance rural population by one simulation turn.
+
+        Rural communities have lower birth rates than cities (less access to
+        healthcare and economic opportunity) but are also more resilient to
+        mild food shortages as subsistence farmers.
+
+        Parameters
+        ----------
+        food_ratio:
+            Planet food level normalised to 1.0 = fully adequate.  Below
+            :data:`_RURAL_STARVE_THRESH` starvation mortality begins to climb.
+        stability:
+            Owner nation's stability (0–100).  Civil unrest suppresses births.
+        """
+        if self.rural_population <= 0:
+            return
+
+        stab_mod    = 0.5 + 0.5 * (stability / 100.0)
+        food_birth  = 0.4 + 0.6 * food_ratio  # less sensitive than urban
+        birth_rate  = _RURAL_BASE_BIRTH * stab_mod * food_birth
+
+        starve_mort = max(
+            0.0,
+            (_RURAL_STARVE_THRESH - food_ratio) * _RURAL_STARVE_MAX / _RURAL_STARVE_THRESH,
+        )
+        total_mort  = _RURAL_BASE_DEATH + starve_mort
+
+        net = birth_rate - total_mort
+        self.rural_population = max(0, int(self.rural_population * (1.0 + net)))

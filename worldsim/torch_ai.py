@@ -29,6 +29,13 @@ try:
 except ImportError:
     pass
 
+# Prefer CUDA when available; otherwise fall back to CPU.
+_DEVICE: "torch.device"
+if _TORCH_AVAILABLE:
+    import torch as _torch_for_device
+    _DEVICE = _torch_for_device.device("cuda" if _torch_for_device.cuda.is_available() else "cpu")
+    del _torch_for_device
+
 
 def torch_available() -> bool:
     """Return ``True`` if ``torch`` is importable."""
@@ -99,7 +106,7 @@ if _TORCH_AVAILABLE:
             self.n_inputs = n_inputs
             self.n_outputs = n_outputs
             self.gamma = gamma
-            self.model = _MLP(n_inputs, n_outputs, hidden)
+            self.model = _MLP(n_inputs, n_outputs, hidden).to(_DEVICE)
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
             self.loss_fn = nn.MSELoss()
 
@@ -110,7 +117,7 @@ if _TORCH_AVAILABLE:
         def _to_tensor(self, inputs: List[float]) -> "torch.Tensor":
             vec = list(inputs)[: self.n_inputs]
             vec += [0.0] * max(0, self.n_inputs - len(vec))
-            return torch.tensor([vec], dtype=torch.float32)
+            return torch.tensor([vec], dtype=torch.float32, device=_DEVICE)
 
         # ------------------------------------------------------------------
         # Public API
@@ -172,7 +179,7 @@ if _TORCH_AVAILABLE:
             sd = payload.get("state_dict")
             if isinstance(sd, dict):
                 obj.model.load_state_dict(
-                    {k: torch.tensor(v) for k, v in sd.items()},
+                    {k: torch.tensor(v, device=_DEVICE) for k, v in sd.items()},
                     strict=False,
                 )
             return obj

@@ -10,6 +10,16 @@ from __future__ import annotations
 
 from .registry import PLANETS
 from .terrain import BIOMES
+from .heightmap import (
+    TERRAIN_DEEP_OCEAN,
+    TERRAIN_OCEAN,
+    TERRAIN_COAST,
+    TERRAIN_LOWLAND,
+    TERRAIN_HIGHLAND,
+    TERRAIN_MOUNTAIN,
+    TERRAIN_PEAK,
+    TERRAIN_NAMES,
+)
 
 # The simulation now relies solely on the Python planet code.
 USE_JAVA_PLANETS = False
@@ -43,6 +53,14 @@ __all__ = [
     'PLANETS',
     'Planet',
     'BIOMES',
+    'TERRAIN_DEEP_OCEAN',
+    'TERRAIN_OCEAN',
+    'TERRAIN_COAST',
+    'TERRAIN_LOWLAND',
+    'TERRAIN_HIGHLAND',
+    'TERRAIN_MOUNTAIN',
+    'TERRAIN_PEAK',
+    'TERRAIN_NAMES',
     'USE_JAVA_PLANETS',
     'set_use_java',
     'City',

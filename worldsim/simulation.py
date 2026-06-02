@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Set
 
 from .ai import DiplomacyAI, DomesticPolicyAI, WarAI
+from .torch_rnn import step_all_base_models as _rnn_step_base_models
+from .torch_rnn import sync_all_meta_ga      as _rnn_sync_meta_ga
 from .culture import Culture
 from .events import EventDecisionEngine, EVENTS
 from .initialization import (
@@ -651,18 +653,24 @@ def run_simulation(
                 ga.step(score)
         for n in nations.values():
             n.step_meta(century)
+        # Push MetaGA fitness into every RNN controller so epsilon and
+        # reward-scale reflect the current genome's performance before the
+        # next set of simulation fifths begins.
+        _rnn_sync_meta_ga(nations)
 
         # Accumulate events across all 5 fifths; print summary once at the end.
         century_events: list = []
+
+        def _process_one(n):
+            n.process_turn(nations)
+            _maybe_apply_soft_great_filter(n)
 
         for fifth in range(1, 6):
             _run_war()
             fifth_events: list = []
 
             nation_list = list(nations.values())
-            for n in nation_list:
-                n.process_turn(nations)
-                _maybe_apply_soft_great_filter(n)
+            pooled_map(_process_one, nation_list, mode="thread")
             descs = engine.maybe_trigger_event_batch(
                 nation_list, collect=log_path is not None
             )
@@ -688,8 +696,7 @@ def run_simulation(
                                 n.name, f"{res['event']}: {res['choice']}"
                             )
 
-            for n in nation_list:
-                n.finalize_turn()
+            pooled_map(lambda n: n.finalize_turn(), nation_list, mode="thread")
             for nid, desc in zip([n.id for n in nation_list], descs):
                 if desc is None:
                     continue
@@ -725,6 +732,9 @@ def run_simulation(
             events=century_events,
             console_ui=console_ui,
         )
+        # Update shared RNN base models from accumulated replay buffers
+        # (called from the main thread, not from threaded nation turns).
+        _rnn_step_base_models()
 
     start_time = time.monotonic()
     try:
@@ -835,8 +845,30 @@ class SimulationLoop:
         self.century += 1
         if self.century % 20 == 0:
             _apply_great_filter(self.nations)
+        # Per-century MetaGA scoring (mirrors _one_century in run_simulation)
+        for n in self.nations.values():
+            score = 0
+            if n.economy < 10.0:  score -= 2
+            if n.economy > 10.0:  score += 2
+            if n.stability > 75.0: score += 20
+            if n.stability > 90.0: score += 20
+            if n.stability > 50.0: score += 20
+            if n.stability < 50.0: score -= 20
+            if n.stability < 40.0: score -= 20
+            if n.stability < 30.0: score -= 20
+            if n.stability < 20.0: score -= 20
+            if n.stability < 10.0: score -= 20
+            for _ in range(n.star_count):   score += 3
+            for _ in range(len(n.fleets)):  score += 4
+            if n.military > 5.0 and n.economy > 5.0: score += 1
+            if n.military < 5.0 and n.economy > 5.0:
+                score -= 10
+                score -= 4 * len(n.divisions)
+            for ga in n.reward_ga.values():
+                ga.step(score)
         for n in self.nations.values():
             n.step_meta(self.century)
+        _rnn_sync_meta_ga(self.nations)
 
         century_events: list = []
 
@@ -911,4 +943,6 @@ class SimulationLoop:
             watch=self.watch_nation,
             events=century_events,
         )
+        # Update shared RNN base models from accumulated replay buffers.
+        _rnn_step_base_models()
 
