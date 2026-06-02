@@ -88,12 +88,18 @@ def process_city_batch(
     radiation_level: float,
     plague_resist: float,
     tech_bonus: float,
+    growth_mult: float = 1.0,
+    cap_mult: float = 1.0,
 ) -> Tuple[int, float]:
     """Vectorized update for a group of cities.
 
     The update now models simple migration when population exceeds
     housing capacity (``infrastructure * 20000``).  A small fraction
     of the excess population leaves the city each turn.
+
+    ``growth_mult`` scales the logistic growth rate and ``cap_mult`` scales the
+    housing carrying capacity — both default to ``1.0`` and are driven by
+    biology tech signals (``pop_growth`` / ``pop_cap``) when supplied.
     """
     if not cities:
         return 0, 0.0
@@ -101,14 +107,14 @@ def process_city_batch(
     if _np is not None:
         pops = _np.array([c.population for c in cities], dtype=float)
         infra = _np.array([c.infrastructure for c in cities], dtype=float)
-        pops = logistic_growth(pops, 0.03, infra * 20000)
+        pops = logistic_growth(pops, 0.03 * growth_mult, infra * 20000 * cap_mult)
         if plague_level > 0:
             effect = plague_level * (1 - plague_resist)
             pops = _np.maximum(0, pops * (1 - effect))
         if radiation_level > 0:
             pops = _np.maximum(0, pops * (1 - radiation_level))
             infra = _np.maximum(1, infra * (1 - radiation_level * 0.1))
-        capacity = infra * 20000
+        capacity = infra * 20000 * cap_mult
         deficit = pops - capacity
         pops = pops - _np.maximum(deficit, 0) * 0.02
         rnd_up = _np.random.random(len(cities)) < 0.1
@@ -141,7 +147,7 @@ def process_city_batch(
     richness_map: Dict[str, float] = {}
     for city in cities:
         city.process_turn(plague_resist)
-        capacity = city.infrastructure * 20000
+        capacity = city.infrastructure * 20000 * cap_mult
         if city.population > capacity:
             loss = int((city.population - capacity) * 0.02)
             city.population -= loss
