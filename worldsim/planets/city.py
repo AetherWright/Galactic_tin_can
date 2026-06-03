@@ -15,7 +15,7 @@ __all__ = ['City', 'process_city_batch', 'process_rural_migration']
 # ---------------------------------------------------------------------------
 
 # Per-turn birth/death rates (1 turn ≈ 20 simulation years).
-_BASE_BIRTH: float = 0.025      # baseline birth contribution
+_BASE_BIRTH: float = 0.020      # baseline birth contribution (settled urban; lower than rural)
 _FRONTIER_BONUS: float = 0.015  # extra births at very low density (pioneer effect)
 _BASE_DEATH: float = 0.010      # baseline natural mortality
 
@@ -29,6 +29,13 @@ _DISEASE_POW: float = 1.5
 
 # Radiation: infrastructure damage + mortality per unit radiation level.
 _RAD_MORT_SCALE: float = 0.08
+# Radiation also impairs fertility; reduces birth rate (floor: 50 % of normal).
+_RAD_FERT_SCALE: float = 0.40
+
+# Instability: civil unrest below stability=50 adds direct mortality (violence,
+# supply-chain collapse, healthcare breakdown).
+_INSTABILITY_THRESH: float = 50.0
+_INSTABILITY_MORT_SCALE: float = 0.005  # max extra mortality per turn at stability=0
 
 # Famine: below this food_ratio (0–1) starvation mortality kicks in.
 _STARVE_THRESH: float = 0.50
@@ -87,7 +94,8 @@ class City:
         frontier = max(0.0, _FRONTIER_BONUS * (1.0 - min(density, 1.0) * 1.5))
         stab_mod = 0.5 + 0.5 * (stability / 100.0)
         food_birth = 0.3 + 0.7 * food_ratio
-        birth_rate = (_BASE_BIRTH + frontier) * stab_mod * food_birth
+        rad_fert = max(0.5, 1.0 - radiation_level * _RAD_FERT_SCALE)
+        birth_rate = (_BASE_BIRTH + frontier) * stab_mod * food_birth * rad_fert
 
         # Death rate
         hc_factor = 1.0 / (1.0 + hospital_count * _HOSP_MORT_SCALE)
@@ -96,7 +104,8 @@ class City:
         rad_mort = radiation_level * _RAD_MORT_SCALE
         starve_mort = max(0.0, (_STARVE_THRESH - food_ratio) * _STARVE_MORT_MAX / _STARVE_THRESH)
         crowd_mort = max(0.0, (density - _CROWD_THRESH) * _CROWD_MORT_SCALE)
-        total_mort = natural_mort + disease_mort + rad_mort + starve_mort + crowd_mort
+        instability_mort = max(0.0, (_INSTABILITY_THRESH - stability) / _INSTABILITY_THRESH * _INSTABILITY_MORT_SCALE)
+        total_mort = natural_mort + disease_mort + rad_mort + starve_mort + crowd_mort + instability_mort
 
         net = birth_rate - total_mort
         self.population = max(0, int(self.population * (1.0 + net)))
@@ -211,7 +220,9 @@ def process_city_batch(
         stab_mod   = 0.5 + 0.5 * (stability / 100.0)
         # Food: famine reduces birth rate toward a hard floor of 0.3.
         food_birth = 0.3 + 0.7 * food_arr
-        birth_rate = (_BASE_BIRTH + frontier) * stab_mod * food_birth * growth_mult
+        # Radiation: impairs fertility (floor at 50 % of normal birth rate).
+        rad_fert   = max(0.5, 1.0 - radiation_level * _RAD_FERT_SCALE)
+        birth_rate = (_BASE_BIRTH + frontier) * stab_mod * food_birth * growth_mult * rad_fert
 
         # ── Death rate ─────────────────────────────────────────────────────
         # Hospitals reduce both natural mortality and plague mortality.
@@ -225,8 +236,10 @@ def process_city_batch(
         starve_mort   = _np.maximum(0.0, (_STARVE_THRESH - food_arr) * (_STARVE_MORT_MAX / _STARVE_THRESH))
         # Overcrowding: density above 90 % → disease, squalor.
         crowd_mort    = _np.maximum(0.0, (density - _CROWD_THRESH) * _CROWD_MORT_SCALE)
+        # Instability: civil war / collapse raises mortality below stability=50.
+        instability_mort = max(0.0, (_INSTABILITY_THRESH - stability) / _INSTABILITY_THRESH * _INSTABILITY_MORT_SCALE)
 
-        total_mort = natural_mort + disease_mort + rad_mort + starve_mort + crowd_mort
+        total_mort = natural_mort + disease_mort + rad_mort + starve_mort + crowd_mort + instability_mort
 
         # ── Net population change ──────────────────────────────────────────
         net_rate = birth_rate - total_mort

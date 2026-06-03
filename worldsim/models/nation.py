@@ -595,6 +595,7 @@ class Nation:
             cpop = process_colony_batch(
                 self.colonies, plague_level, plague_res,
                 stability=self.stability,
+                radiation_level=radiation_level,
             )
             total_pop += cpop
 
@@ -610,6 +611,7 @@ class Nation:
                         food_ratio=food_ratio,
                         stability=self.stability,
                     )
+                    total_pop += county.rural_population
         if _np is not None:
             if self.mines:
                 arr = _np.array([m.output for m in self.mines], dtype=float)

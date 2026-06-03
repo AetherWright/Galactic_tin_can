@@ -637,7 +637,7 @@ class Planet:
 
     def upgrade_colony(self, colony: 'Colony', owner: int) -> 'City':
         """Replace ``colony`` with a fully fledged city."""
-        city = City(colony.x, colony.y, self.name, owner=owner, population=5000)
+        city = City(colony.x, colony.y, self.name, owner=owner, population=colony.population)
         self.cities[(colony.x, colony.y)] = city
         self.colonies.pop((colony.x, colony.y), None)
         county = self.get_county(colony.x, colony.y)
