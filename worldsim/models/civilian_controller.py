@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ..utils import distance_sq
 from ..planets import PLANETS
@@ -51,6 +52,7 @@ __all__ = [
     "N_CIVILIAN_DEPARTMENTS",
     "ActionEntry",
     "CivilianDepartment",
+    "CivilianController",
     "process_action_queue",
 ]
 
@@ -192,6 +194,99 @@ assert set(_ACTION_BY_IDX.keys()) == set(range(21)), (
 
 
 # ---------------------------------------------------------------------------
+# CivilianController — hierarchical overseer + per-department sub-models
+# ---------------------------------------------------------------------------
+
+class CivilianController:
+    """Hierarchical civilian AI: overseer routes to per-department sub-models.
+
+    The overseer selects which department handles the current turn (6-way
+    choice); the chosen department's model then selects a local action within
+    that department's sub-space (3–5 choices).  Both models are trained on
+    the same reward signal after each decision.
+
+    All sub-models share the same 20-feature state vector as the old flat
+    model.  Sub-model local indices map to global action indices via
+    ``CivilianDepartment.actions[local_idx].idx``.
+
+    Persistence
+    -----------
+    ``save_table`` / ``load_table`` accept a *base* path (e.g.
+    ``nation_0_civilian.yml``) and derive sub-paths automatically::
+
+        nation_0_civilian_overseer.yml
+        nation_0_civilian_interior.yml
+        nation_0_civilian_industry.yml
+        ...
+    """
+
+    def __init__(
+        self,
+        overseer:        Any,
+        dept_models:     Dict[str, Any],
+        base_table_path: "Optional[str | Path]" = None,
+    ) -> None:
+        self.overseer    = overseer
+        self.dept_models = dept_models           # slug → model
+        self._base_path  = Path(base_table_path) if base_table_path else None
+        if self._base_path:
+            self.load_table(self._base_path)
+
+    # ------------------------------------------------------------------
+    # MetaGA integration
+    # ------------------------------------------------------------------
+
+    def sync_meta_ga(self, ga: object) -> None:
+        """Propagate MetaGA fitness state to the overseer and every dept model."""
+        for m in (self.overseer, *self.dept_models.values()):
+            if hasattr(m, "sync_meta_ga"):
+                m.sync_meta_ga(ga)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_table(self, path: "Optional[str | Path]" = None) -> None:
+        target = Path(path) if path else self._base_path
+        if target is None:
+            return
+        self._base_path = target
+        stem, suffix = target.stem, target.suffix
+        self.overseer.save_table(target.with_name(f"{stem}_overseer{suffix}"))
+        for slug, model in self.dept_models.items():
+            model.save_table(target.with_name(f"{stem}_{slug}{suffix}"))
+
+    def load_table(self, path: "str | Path") -> None:
+        target = Path(path)
+        stem, suffix = target.stem, target.suffix
+        self.overseer.load_table(target.with_name(f"{stem}_overseer{suffix}"))
+        for slug, model in self.dept_models.items():
+            model.load_table(target.with_name(f"{stem}_{slug}{suffix}"))
+
+    # ------------------------------------------------------------------
+    # Training helper for queued actions (global index → both models)
+    # ------------------------------------------------------------------
+
+    def train_on_global_action(
+        self,
+        state:      List[float],
+        global_idx: int,
+        reward:     float,
+        new_state:  List[float],
+    ) -> None:
+        """Train overseer + dept model given a global action index.
+
+        Used by ``process_action_queue`` where only the global index is known.
+        """
+        for dept_idx, dept in enumerate(DEPARTMENTS):
+            for local_idx, action in enumerate(dept.actions):
+                if action.idx == global_idx:
+                    self.overseer.train(state, dept_idx, reward, new_state)
+                    self.dept_models[dept.slug].train(state, local_idx, reward, new_state)
+                    return
+
+
+# ---------------------------------------------------------------------------
 # State vector (unchanged — same 20 features as before)
 # ---------------------------------------------------------------------------
 
@@ -242,18 +337,48 @@ def _valid_action_mask(nation: "Nation") -> List[bool]:
 # Main AI loop
 # ---------------------------------------------------------------------------
 
-def _apply_civilian_ai(nation: "Nation") -> None:
+def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) -> None:
+    """Two-level action selection: overseer picks department, dept model picks action."""
     state = _civilian_state(nation)
 
-    valid_mask = _valid_action_mask(nation)
-    idx = nation.civilian_ai.choose_action(state, valid_mask)
+    # A department is valid iff it has at least one currently valid action.
+    dept_valid = [
+        any(a.mask_fn(nation) for a in dept.actions)
+        for dept in DEPARTMENTS
+    ]
+    dept_local_idx = ctrl.overseer.choose_action(state, dept_valid)
+    dept = DEPARTMENTS[dept_local_idx]
 
-    nation.last_civilian_action = idx
-    _execute_civilian_action(nation, idx)
+    dept_model  = ctrl.dept_models[dept.slug]
+    local_valid = [a.mask_fn(nation) for a in dept.actions]
+    local_idx   = dept_model.choose_action(state, local_valid)
+
+    global_idx = dept.actions[local_idx].idx
+    nation.last_civilian_action = global_idx
+    _execute_civilian_action(nation, global_idx)
 
     new_state = _civilian_state(nation)
-    reward = nation.compute_reward("civilian", state, new_state)
-    nation.civilian_ai.train(state, idx, reward, new_state)
+    reward    = nation.compute_reward("civilian", state, new_state)
+
+    ctrl.overseer.train(state, dept_local_idx, reward, new_state)
+    dept_model.train(state, local_idx, reward, new_state)
+
+
+def _apply_civilian_ai(nation: "Nation") -> None:
+    ctrl = nation.civilian_ai
+    if isinstance(ctrl, CivilianController):
+        _apply_hierarchical_civilian_ai(nation, ctrl)
+        return
+
+    # Legacy flat model.
+    state      = _civilian_state(nation)
+    valid_mask = _valid_action_mask(nation)
+    idx        = ctrl.choose_action(state, valid_mask)
+    nation.last_civilian_action = idx
+    _execute_civilian_action(nation, idx)
+    new_state  = _civilian_state(nation)
+    reward     = nation.compute_reward("civilian", state, new_state)
+    ctrl.train(state, idx, reward, new_state)
 
 
 def process_action_queue(nation: "Nation", limit: int = 2) -> None:
@@ -262,13 +387,17 @@ def process_action_queue(nation: "Nation", limit: int = 2) -> None:
     # length could skip items or pop from an exhausted queue.  We process at
     # most ``limit`` actions per call regardless of mid-loop growth.
     processed = 0
+    ctrl = nation.civilian_ai
     while nation.action_queue and processed < limit:
-        idx = nation.action_queue.pop(0)
-        state = _civilian_state(nation)
+        idx       = nation.action_queue.pop(0)
+        state     = _civilian_state(nation)
         _execute_civilian_action(nation, idx)
         new_state = _civilian_state(nation)
-        reward = nation.compute_reward("civilian", state, new_state)
-        nation.civilian_ai.train(state, idx, reward, new_state)
+        reward    = nation.compute_reward("civilian", state, new_state)
+        if isinstance(ctrl, CivilianController):
+            ctrl.train_on_global_action(state, idx, reward, new_state)
+        else:
+            ctrl.train(state, idx, reward, new_state)
         processed += 1
 
 
@@ -304,13 +433,16 @@ def _random_civilian_actions(
                 nation.cities.remove(victim)
 
     if nation.civilian_ai is not None:
-        state = _civilian_state(nation)
-        valid_mask = _valid_action_mask(nation)
-        idx = nation.civilian_ai.choose_action(state, valid_mask)
-        _execute_civilian_action(nation, idx)
-        new_state = _civilian_state(nation)
-        reward = nation.compute_reward("civilian", state, new_state)
-        nation.civilian_ai.train(state, idx, reward, new_state)
+        if isinstance(nation.civilian_ai, CivilianController):
+            _apply_hierarchical_civilian_ai(nation, nation.civilian_ai)
+        else:
+            state      = _civilian_state(nation)
+            valid_mask = _valid_action_mask(nation)
+            idx        = nation.civilian_ai.choose_action(state, valid_mask)
+            _execute_civilian_action(nation, idx)
+            new_state  = _civilian_state(nation)
+            reward     = nation.compute_reward("civilian", state, new_state)
+            nation.civilian_ai.train(state, idx, reward, new_state)
         return
 
     if random.random() < 0.03:

@@ -7,7 +7,10 @@ import random
 import asyncio
 import math
 
-from ..ai import DomesticPolicyAI, ProjectAI, DiplomacyAI, ResearchAI, WarAI
+from ..ai import (
+    DomesticPolicyAI, ProjectAI, DiplomacyAI, ResearchAI, WarAI,
+    CivilianOverseerAI, DepartmentPolicyAI,
+)
 from .diplomacy import (
     Message,
     can_communicate,
@@ -105,12 +108,15 @@ from .infrastructure import (
     colonize_planet     as _infra_colonize_planet,
 )
 from .civilian_controller import (
-    _civilian_state        as _cc_civilian_state,
+    _civilian_state          as _cc_civilian_state,
     _execute_civilian_action as _cc_execute_civilian_action,
-    _valid_action_mask     as _cc_valid_action_mask,
-    _apply_civilian_ai     as _cc_apply_civilian_ai,
+    _valid_action_mask       as _cc_valid_action_mask,
+    _apply_civilian_ai       as _cc_apply_civilian_ai,
     _random_civilian_actions as _cc_random_civilian_actions,
-    process_action_queue   as _cc_process_action_queue,
+    process_action_queue     as _cc_process_action_queue,
+    CivilianController,
+    DEPARTMENTS,
+    N_CIVILIAN_DEPARTMENTS,
 )
 
 
@@ -251,7 +257,8 @@ class Nation:
             from ..torch_rnn import (
                 rnn_available,
                 TorchWarAI,
-                TorchDomesticPolicyAI,
+                TorchCivilianOverseer,
+                TorchDepartmentAI,
                 TorchProjectAI,
                 TorchDiplomacyAI,
                 TorchResearchAI,
@@ -265,8 +272,17 @@ class Nation:
             self.military_ai  = TorchWarAI(
                 allies_dim=ally_dim, table_path=military_path
             )
-            self.civilian_ai  = TorchDomesticPolicyAI(
-                21, n_inputs=20, table_path=civilian_path
+            self.civilian_ai  = CivilianController(
+                overseer=TorchCivilianOverseer(
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=20,
+                ),
+                dept_models={
+                    dept.slug: TorchDepartmentAI(
+                        dept.slug, dept.n_actions, n_inputs=20,
+                    )
+                    for dept in DEPARTMENTS
+                },
+                base_table_path=civilian_path,
             )
             self.project_ai   = TorchProjectAI(
                 len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
@@ -280,10 +296,17 @@ class Nation:
             self.doctrine_ai  = TorchDoctrineAI(table_path=doctrine_path)
         else:
             self.military_ai  = WarAI(allies_dim=ally_dim, table_path=military_path)
-            self.civilian_ai  = DomesticPolicyAI(
-                21, n_inputs=20,
-                hidden_layers=(32, 24, 16, 10, 8, 7, 7, 8, 10, 16, 24, 32),
-                table_path=civilian_path,
+            self.civilian_ai  = CivilianController(
+                overseer=CivilianOverseerAI(
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=20,
+                ),
+                dept_models={
+                    dept.slug: DepartmentPolicyAI(
+                        dept.slug, dept.n_actions, n_inputs=20,
+                    )
+                    for dept in DEPARTMENTS
+                },
+                base_table_path=civilian_path,
             )
             self.project_ai   = ProjectAI(
                 len(PROJECT_CATALOG), n_inputs=6, table_path=project_path

@@ -1133,6 +1133,48 @@ class DomesticPolicyAI(NelderMeadPolicy):
         )
 
 
+class CivilianOverseerAI(NelderMeadPolicy):
+    """Nelder-Mead overseer: routes to one of the N civilian departments."""
+
+    def __init__(
+        self,
+        n_depts: int = 6,
+        n_inputs: int = 20,
+        *,
+        table_path: str | Path | None = None,
+        epsilon: float = 0.10,
+        gamma: float = 0.95,
+        hidden_layers: Sequence[int] = (16, 12, 8, 6, 8, 12, 16),
+    ) -> None:
+        super().__init__(
+            n_inputs, n_depts,
+            table_path=table_path, epsilon=epsilon, gamma=gamma,
+            hidden_layers=hidden_layers,
+        )
+
+
+class DepartmentPolicyAI(NelderMeadPolicy):
+    """Nelder-Mead learner for a single department's local action sub-space."""
+
+    def __init__(
+        self,
+        slug: str,
+        n_actions: int,
+        n_inputs: int = 20,
+        *,
+        table_path: str | Path | None = None,
+        epsilon: float = 0.10,
+        gamma: float = 0.95,
+        hidden_layers: Sequence[int] = (12, 9, 7, 5, 7, 9, 12),
+    ) -> None:
+        super().__init__(
+            n_inputs, n_actions,
+            table_path=table_path, epsilon=epsilon, gamma=gamma,
+            hidden_layers=hidden_layers,
+        )
+        self.slug = slug
+
+
 class ProjectAI(NelderMeadPolicy):
     """Nelder-Mead learner for construction project decisions."""
 
