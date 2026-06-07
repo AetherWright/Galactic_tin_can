@@ -3,11 +3,36 @@
 All functions take a ``Nation`` instance as their first parameter, following
 the same pattern used in ``war.py`` and ``diplomacy.py``.  The ``Nation``
 class keeps thin wrapper methods so existing call sites are unaffected.
+
+Action space
+------------
+The 21 civilian actions are organised into six *departments*.  Each
+department is a natural sub-model boundary: eventually the current
+``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` will act as an overseer
+that picks which department handles a given turn, while dedicated per-
+department models handle the fine-grained choice within that space.
+
+For now the single existing model still selects from all 21 actions using
+their flat global indices (0–20).  The department structure is metadata
+only — no behaviour changes.
+
+Department layout
+-----------------
+    interior   (4)  — build_city, hospital, school, upgrade_assets
+    industry   (4)  — mine, port, factory, power_plant
+    defense    (4)  — base, nuke_facility, orbital_defense, division
+    fleet      (5)  — shipyard, frigate, transport, cruiser, battleship
+    science    (3)  — spaceport, lab, colonize_planet
+    executive  (1)  — start_project
+
+Global indices are **stable** — renumbering breaks trained weights.
+Local index within a department = position in ``CivilianDepartment.actions``.
 """
 from __future__ import annotations
 
 import random
-from typing import Dict, List, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple, TYPE_CHECKING
 
 from ..utils import distance_sq
 from ..planets import PLANETS
@@ -18,6 +43,157 @@ from .star import STARS
 if TYPE_CHECKING:
     from .nation import Nation
 
+
+__all__ = [
+    "DEPARTMENTS",
+    "ACTION_GROUPS",
+    "N_CIVILIAN_ACTIONS",
+    "N_CIVILIAN_DEPARTMENTS",
+    "ActionEntry",
+    "CivilianDepartment",
+    "process_action_queue",
+]
+
+
+# ---------------------------------------------------------------------------
+# Action entry & department definitions
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ActionEntry:
+    """One leaf action in the civilian action space.
+
+    ``idx``      — global action index (0–20); stable, referenced by the NN.
+    ``name``     — human-readable identifier.
+    ``mask_fn``  — (Nation) → bool; True when the action is currently valid.
+    ``build_fn`` — (Nation) → None; executes the action.
+    """
+    idx:      int
+    name:     str
+    mask_fn:  Callable[["Nation"], bool]
+    build_fn: Callable[["Nation"], None]
+
+
+@dataclass(frozen=True)
+class CivilianDepartment:
+    """A logical group of related civilian actions and their future sub-model boundary.
+
+    ``slug``    — short identifier used as a dict key (e.g. ``"interior"``).
+    ``label``   — display name.
+    ``actions`` — ordered tuple of :class:`ActionEntry` objects.
+
+    The local index within a department is the position in ``actions``.
+    Map to a global index with ``department.actions[local_idx].idx``.
+    """
+    slug:    str
+    label:   str
+    actions: Tuple[ActionEntry, ...]
+
+    @property
+    def global_indices(self) -> Tuple[int, ...]:
+        """Global action indices belonging to this department."""
+        return tuple(a.idx for a in self.actions)
+
+    @property
+    def n_actions(self) -> int:
+        return len(self.actions)
+
+
+def _always_valid(_: "Nation") -> bool:
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Department definitions
+# Global indices MUST NOT be renumbered — existing NN weights depend on them.
+# ---------------------------------------------------------------------------
+
+DEPARTMENTS: Tuple[CivilianDepartment, ...] = (
+
+    CivilianDepartment("interior", "Interior & Welfare", (
+        ActionEntry(0,  "build_city",     _always_valid, lambda n: n.build_city()),
+        ActionEntry(5,  "build_hospital", _always_valid, lambda n: n.build_hospital()),
+        ActionEntry(7,  "build_school",   _always_valid, lambda n: n.build_school()),
+        ActionEntry(19, "upgrade_assets", _always_valid, lambda n: n.upgrade_assets()),
+    )),
+
+    CivilianDepartment("industry", "Industry & Resources", (
+        ActionEntry(2,  "build_mine",        _always_valid, lambda n: n.build_mine()),
+        ActionEntry(3,  "build_port",        _always_valid, lambda n: n.build_port()),
+        ActionEntry(4,  "build_factory",     _always_valid, lambda n: n.build_factory()),
+        ActionEntry(8,  "build_power_plant", _always_valid, lambda n: n.build_power_plant()),
+    )),
+
+    CivilianDepartment("defense", "Defense", (
+        ActionEntry(1,  "build_base",            _always_valid,
+                    lambda n: n.build_base()),
+        ActionEntry(11, "build_nuke_facility",
+                    lambda n: "Nuclear Weapons" in n.tech_tree.unlocked,
+                    lambda n: n.build_nuke_facility()),
+        ActionEntry(12, "build_orbital_defense", _always_valid,
+                    lambda n: n.build_orbital_defense()),
+        ActionEntry(13, "build_division",        _always_valid,
+                    lambda n: build_division(n)),
+    )),
+
+    CivilianDepartment("fleet", "Fleet & Naval", (
+        ActionEntry(6,  "build_shipyard",             _always_valid,
+                    lambda n: n.build_shipyard()),
+        ActionEntry(14, "build_fleet_ship_frigate",   lambda n: bool(n.shipyards),
+                    lambda n: n.build_fleet_ship("Frigate")),
+        ActionEntry(15, "build_fleet_ship_transport", lambda n: bool(n.shipyards),
+                    lambda n: n.build_fleet_ship("Transport")),
+        ActionEntry(16, "build_fleet_ship_cruiser",   lambda n: bool(n.shipyards),
+                    lambda n: n.build_fleet_ship("Cruiser")),
+        ActionEntry(17, "build_fleet_ship_battleship", lambda n: bool(n.shipyards),
+                    lambda n: n.build_fleet_ship("Battleship")),
+    )),
+
+    CivilianDepartment("science", "Science & Exploration", (
+        ActionEntry(9,  "build_spaceport",  _always_valid,
+                    lambda n: n.build_spaceport()),
+        ActionEntry(10, "build_lab",        _always_valid,
+                    lambda n: n.build_lab()),
+        ActionEntry(18, "colonize_planet",
+                    lambda n: n.star_count < len([s for s in STARS.values() if s.owner is None]),
+                    lambda n: n.colonize_planet()),
+    )),
+
+    CivilianDepartment("executive", "Executive", (
+        ActionEntry(20, "start_project", _always_valid, lambda n: n.start_project()),
+    )),
+)
+
+
+# ---------------------------------------------------------------------------
+# Derived constants — single source of truth for sizes and group slices
+# ---------------------------------------------------------------------------
+
+N_CIVILIAN_ACTIONS: int = sum(d.n_actions for d in DEPARTMENTS)       # 21
+N_CIVILIAN_DEPARTMENTS: int = len(DEPARTMENTS)                          # 6
+
+# Maps department slug → tuple of global indices; ready for overseer routing.
+ACTION_GROUPS: Dict[str, Tuple[int, ...]] = {
+    d.slug: d.global_indices for d in DEPARTMENTS
+}
+
+# Convenience reverse-lookup: global action index → ActionEntry.
+_ACTION_BY_IDX: Dict[int, ActionEntry] = {
+    a.idx: a for dept in DEPARTMENTS for a in dept.actions
+}
+
+# Sanity-check at import time: all 21 global indices must be covered exactly once.
+assert N_CIVILIAN_ACTIONS == 21, (
+    f"Expected 21 civilian actions across departments, got {N_CIVILIAN_ACTIONS}"
+)
+assert set(_ACTION_BY_IDX.keys()) == set(range(21)), (
+    "Civilian action indices must cover 0–20 exactly once across all departments"
+)
+
+
+# ---------------------------------------------------------------------------
+# State vector (unchanged — same 20 features as before)
+# ---------------------------------------------------------------------------
 
 def _civilian_state(nation: "Nation") -> List[float]:
     return [
@@ -44,65 +220,27 @@ def _civilian_state(nation: "Nation") -> List[float]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Action dispatch & validity mask — derived from DEPARTMENTS
+# ---------------------------------------------------------------------------
+
 def _execute_civilian_action(nation: "Nation", idx: int) -> None:
-    actions = [
-        nation.build_city,
-        nation.build_base,
-        nation.build_mine,
-        nation.build_port,
-        nation.build_factory,
-        nation.build_hospital,
-        nation.build_shipyard,
-        nation.build_school,
-        nation.build_power_plant,
-        nation.build_spaceport,
-        nation.build_lab,
-        nation.build_nuke_facility,
-        nation.build_orbital_defense,
-        lambda: build_division(nation),
-        lambda: nation.build_fleet_ship("Frigate"),
-        lambda: nation.build_fleet_ship("Transport"),
-        lambda: nation.build_fleet_ship("Cruiser"),
-        lambda: nation.build_fleet_ship("Battleship"),
-        nation.colonize_planet,
-        nation.upgrade_assets,
-        nation.start_project,
-    ]
-    if 0 <= idx < len(actions):
-        actions[idx]()
+    action = _ACTION_BY_IDX.get(idx)
+    if action is not None:
+        action.build_fn(nation)
 
 
 def _valid_action_mask(nation: "Nation") -> List[bool]:
-    has_nuke_tech = "Nuclear Weapons" in nation.tech_tree.unlocked
-    has_shipyard = len(nation.shipyards) > 0
-    # colonize_planet() itself has no spaceport guard — mask only on available
-    # free stars so the action is suppressed when there is nowhere to go.
-    can_colonize = nation.star_count < len([s for s in STARS.values() if s.owner is None])
+    mask = [False] * N_CIVILIAN_ACTIONS
+    for dept in DEPARTMENTS:
+        for action in dept.actions:
+            mask[action.idx] = action.mask_fn(nation)
+    return mask
 
-    return [
-        True,           # build_city
-        True,           # build_base
-        True,           # build_mine
-        True,           # build_port
-        True,           # build_factory
-        True,           # build_hospital
-        True,           # build_shipyard
-        True,           # build_school
-        True,           # build_power_plant
-        True,           # build_spaceport
-        True,           # build_lab
-        has_nuke_tech,  # build_nuke_facility
-        True,           # build_orbital_defense
-        True,           # build_division
-        has_shipyard,   # frigate
-        has_shipyard,   # transport
-        has_shipyard,   # cruiser
-        has_shipyard,   # battleship
-        can_colonize,   # colonize_planet
-        True,           # upgrade_assets
-        True,           # start_project
-    ]
 
+# ---------------------------------------------------------------------------
+# Main AI loop
+# ---------------------------------------------------------------------------
 
 def _apply_civilian_ai(nation: "Nation") -> None:
     state = _civilian_state(nation)
