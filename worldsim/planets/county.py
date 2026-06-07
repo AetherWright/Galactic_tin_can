@@ -13,8 +13,8 @@ from ..ideas import Idea
 # access, so natural mortality is slightly higher than urban.
 _RURAL_BASE_BIRTH: float = 0.025   # per turn; higher than settled urban (0.020)
 _RURAL_BASE_DEATH: float = 0.013   # slightly higher natural mortality than cities (no hospitals)
-_RURAL_STARVE_THRESH: float = 0.40 # food_ratio below which starvation sets in
-_RURAL_STARVE_MAX: float   = 0.06  # maximum starvation mortality
+_RURAL_STARVE_THRESH: float = 0.30 # food_ratio below which starvation sets in
+_RURAL_STARVE_MAX: float   = 0.03  # maximum starvation mortality
 _RURAL_INSTABILITY_SCALE: float = 0.005  # max extra mortality per turn at stability=0
 
 

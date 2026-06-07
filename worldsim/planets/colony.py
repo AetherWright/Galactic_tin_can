@@ -20,12 +20,12 @@ _COL_FRONTIER:   float  = 0.020   # strong pioneer bonus at low density
 _COL_BASE_DEATH: float  = 0.014   # higher baseline mortality (frontier conditions)
 _COL_DISEASE_POW: float = 1.5     # same super-linear plague response as cities
 _COL_DISEASE_SCALE: float = 0.15
-_COL_STARVE_THRESH: float = 0.40  # colonies are more resilient to mild food stress
-_COL_STARVE_MAX: float   = 0.08
+_COL_STARVE_THRESH: float = 0.30  # colonies are more resilient to mild food stress
+_COL_STARVE_MAX: float   = 0.04
 _COL_RAD_MORT_SCALE: float = 0.08  # radiation mortality — same scale as cities
 _COL_RAD_FERT_SCALE: float = 0.40  # radiation fertility penalty (floor: 50 %)
 _COL_CAP: int            = 8_000  # colony population ceiling before city graduation
-_COL_FOOD_ADEQUATE: float = 50.0  # food units = fully adequate (matches city constant)
+_COL_FOOD_ADEQUATE: float = 20.0  # food units = fully adequate (matches city constant)
 
 
 @dataclass

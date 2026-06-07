@@ -54,7 +54,7 @@ def collect_resources(nation: "Nation") -> None:
         planet = PLANETS.get(_city.planet)
         if not planet:
             continue
-        nation.add_resource("food", planet.extract_resource("food", 5.0 * food_mult))
+        nation.add_resource("food", planet.extract_resource("food", 1.0 * food_mult))
 
 
 # ---------------------------------------------------------------------------

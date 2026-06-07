@@ -626,7 +626,7 @@ class Nation:
         if planet is not None:
             food_ratio = min(
                 1.0,
-                planet.resources.get('food', 50.0) / 50.0,
+                planet.resources.get('food', 20.0) / 20.0,
             )
             for county in planet.counties.values():
                 if county.owner == self.id:

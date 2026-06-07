@@ -38,8 +38,8 @@ _INSTABILITY_THRESH: float = 50.0
 _INSTABILITY_MORT_SCALE: float = 0.005  # max extra mortality per turn at stability=0
 
 # Famine: below this food_ratio (0–1) starvation mortality kicks in.
-_STARVE_THRESH: float = 0.50
-_STARVE_MORT_MAX: float = 0.10  # max starvation mortality when food_ratio → 0
+_STARVE_THRESH: float = 0.35
+_STARVE_MORT_MAX: float = 0.04  # max starvation mortality when food_ratio → 0
 
 # Overcrowding: density above this threshold adds squalor/disease mortality.
 _CROWD_THRESH: float = 0.90
@@ -51,8 +51,10 @@ _INFRA_ECON_SCALE: float = 20.0 # target_infra = econ_health * ECON_SCALE
 _INFRA_ADJUST_RATE: float = 0.03  # fraction of gap closed per turn
 
 # Food adequacy reference: a planet with this many stored food units is
-# considered fully adequate (food_ratio = 1.0).
-_FOOD_ADEQUATE: float = 50.0
+# considered fully adequate (food_ratio = 1.0).  Set to the mid-range of the
+# harshest biomes (ice/volcanic floor at 10) so starting conditions are never
+# below the starvation threshold.
+_FOOD_ADEQUATE: float = 20.0
 
 
 @dataclass

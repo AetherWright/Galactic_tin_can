@@ -388,7 +388,7 @@ class Planet:
             cap = float(rng[1])
             current = self.resources.get(resource, 0.0)
             if current < cap:
-                regen = cap * 0.02  # 2% of cap per turn
+                regen = cap * 0.05  # 5% of cap per turn
                 self.resources[resource] = min(cap, current + regen)
     def _compute_distance(
         self, a: Tuple[int, int, str], b: Tuple[int, int, str]
