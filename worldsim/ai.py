@@ -1139,7 +1139,7 @@ class CivilianOverseerAI(NelderMeadPolicy):
     def __init__(
         self,
         n_depts: int = 6,
-        n_inputs: int = 20,
+        n_inputs: int = 22,
         *,
         table_path: str | Path | None = None,
         epsilon: float = 0.10,
@@ -1160,7 +1160,7 @@ class DepartmentPolicyAI(NelderMeadPolicy):
         self,
         slug: str,
         n_actions: int,
-        n_inputs: int = 20,
+        n_inputs: int = 22,
         *,
         table_path: str | Path | None = None,
         epsilon: float = 0.10,

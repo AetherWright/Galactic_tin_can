@@ -10,6 +10,7 @@ __all__ = [
     'ResearchLab',
     'MilitaryBase',
     'Mine',
+    'Farm',
     'Port',
     'Factory',
     'Hospital',
@@ -111,6 +112,29 @@ class Mine:
         """Boost mine output by ``amount`` for both metals and uranium."""
         self.output += amount
         self.uranium += amount * 0.5
+
+
+@dataclass
+class Farm:
+    """Agricultural facility that produces food from the planet's biome each turn.
+
+    Output is in abstract food units per turn.  The effective yield is
+    multiplied by a biome-specific factor (``BIOME_FARM_YIELD``) so fertile
+    biomes (forest, oceanic) produce far more than harsh ones (volcanic, ice).
+    """
+
+    x: int
+    y: int
+    planet: str
+    owner: Optional[int] = None
+    output: float = field(default_factory=lambda: random.uniform(8.0, 12.0))
+
+    @property
+    def coords(self) -> Tuple[int, int]:
+        return self.x, self.y
+
+    def upgrade(self, amount: float = 2.0) -> None:
+        self.output += amount
 
 
 @dataclass

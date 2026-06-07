@@ -55,6 +55,7 @@ from ..planets import (
     ResearchLab,
     MilitaryBase,
     Mine,
+    Farm,
     Port,
     Factory,
     Hospital,
@@ -94,6 +95,7 @@ from .infrastructure import (
     build_city          as _infra_build_city,
     build_base          as _infra_build_base,
     build_mine          as _infra_build_mine,
+    build_farm          as _infra_build_farm,
     build_port          as _infra_build_port,
     build_factory       as _infra_build_factory,
     build_hospital      as _infra_build_hospital,
@@ -170,6 +172,7 @@ class Nation:
     cities: List[City] = field(default_factory=list)
     bases: List[MilitaryBase] = field(default_factory=list)
     mines: List[Mine] = field(default_factory=list)
+    farms: List[Farm] = field(default_factory=list)
     ports: List[Port] = field(default_factory=list)
     factories: List[Factory] = field(default_factory=list)
     hospitals: List[Hospital] = field(default_factory=list)
@@ -274,11 +277,11 @@ class Nation:
             )
             self.civilian_ai  = CivilianController(
                 overseer=TorchCivilianOverseer(
-                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=20,
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22,
                 ),
                 dept_models={
                     dept.slug: TorchDepartmentAI(
-                        dept.slug, dept.n_actions, n_inputs=20,
+                        dept.slug, dept.n_actions, n_inputs=22,
                     )
                     for dept in DEPARTMENTS
                 },
@@ -298,11 +301,11 @@ class Nation:
             self.military_ai  = WarAI(allies_dim=ally_dim, table_path=military_path)
             self.civilian_ai  = CivilianController(
                 overseer=CivilianOverseerAI(
-                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=20,
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22,
                 ),
                 dept_models={
                     dept.slug: DepartmentPolicyAI(
-                        dept.slug, dept.n_actions, n_inputs=20,
+                        dept.slug, dept.n_actions, n_inputs=22,
                     )
                     for dept in DEPARTMENTS
                 },
@@ -754,6 +757,9 @@ class Nation:
 
     def build_mine(self) -> None:
         _infra_build_mine(self)
+
+    def build_farm(self) -> None:
+        _infra_build_farm(self)
 
     def build_port(self) -> None:
         _infra_build_port(self)

@@ -6,20 +6,20 @@ class keeps thin wrapper methods so existing call sites are unaffected.
 
 Action space
 ------------
-The 21 civilian actions are organised into six *departments*.  Each
+The 22 civilian actions are organised into six *departments*.  Each
 department is a natural sub-model boundary: eventually the current
 ``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` will act as an overseer
 that picks which department handles a given turn, while dedicated per-
 department models handle the fine-grained choice within that space.
 
-For now the single existing model still selects from all 21 actions using
-their flat global indices (0–20).  The department structure is metadata
+For now the single existing model still selects from all 22 actions using
+their flat global indices (0–21).  The department structure is metadata
 only — no behaviour changes.
 
 Department layout
 -----------------
     interior   (4)  — build_city, hospital, school, upgrade_assets
-    industry   (4)  — mine, port, factory, power_plant
+    industry   (5)  — mine, port, factory, power_plant, farm
     defense    (4)  — base, nuke_facility, orbital_defense, division
     fleet      (5)  — shipyard, frigate, transport, cruiser, battleship
     science    (3)  — spaceport, lab, colonize_planet
@@ -124,6 +124,7 @@ DEPARTMENTS: Tuple[CivilianDepartment, ...] = (
         ActionEntry(3,  "build_port",        _always_valid, lambda n: n.build_port()),
         ActionEntry(4,  "build_factory",     _always_valid, lambda n: n.build_factory()),
         ActionEntry(8,  "build_power_plant", _always_valid, lambda n: n.build_power_plant()),
+        ActionEntry(21, "build_farm",        _always_valid, lambda n: n.build_farm()),
     )),
 
     CivilianDepartment("defense", "Defense", (
@@ -184,12 +185,10 @@ _ACTION_BY_IDX: Dict[int, ActionEntry] = {
     a.idx: a for dept in DEPARTMENTS for a in dept.actions
 }
 
-# Sanity-check at import time: all 21 global indices must be covered exactly once.
-assert N_CIVILIAN_ACTIONS == 21, (
-    f"Expected 21 civilian actions across departments, got {N_CIVILIAN_ACTIONS}"
-)
-assert set(_ACTION_BY_IDX.keys()) == set(range(21)), (
-    "Civilian action indices must cover 0–20 exactly once across all departments"
+# Sanity-check at import time: all global indices must be covered exactly once.
+assert set(_ACTION_BY_IDX.keys()) == set(range(N_CIVILIAN_ACTIONS)), (
+    f"Civilian action indices must cover 0–{N_CIVILIAN_ACTIONS - 1} exactly once "
+    f"across all departments (found {sorted(_ACTION_BY_IDX.keys())})"
 )
 
 
@@ -287,10 +286,17 @@ class CivilianController:
 
 
 # ---------------------------------------------------------------------------
-# State vector (unchanged — same 20 features as before)
+# State vector — 22 features
+# ---------------------------------------------------------------------------
+# Features 0–19: original economic/military/diplomatic signals.
+# Feature 20: food_ratio — planet food / 20.0 (signals food pressure to the AI
+#             so it can learn to prioritise build_farm when food is running low).
+# Feature 21: farm count — number of owned farms.
 # ---------------------------------------------------------------------------
 
 def _civilian_state(nation: "Nation") -> List[float]:
+    planet = PLANETS.get(nation.planet)
+    food_ratio = min(1.0, planet.resources.get("food", 20.0) / 20.0) if planet else 1.0
     return [
         nation.economy,
         nation.technology.overall,
@@ -312,6 +318,8 @@ def _civilian_state(nation: "Nation") -> List[float]:
         nation.resources.get("energy", 0.0) / 100.0,
         float(len(nation.at_war)),
         float(len(nation.alliances)),
+        food_ratio,
+        float(len(nation.farms)),
     ]
 
 

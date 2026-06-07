@@ -899,15 +899,15 @@ if _TORCH_AVAILABLE:
     class TorchCivilianOverseer(_RoleController):
         """Overseer model that routes to one of the civilian departments.
 
-        Selects among N departments (6-way choice) using the same 20-feature
-        state vector as the old flat model.  Trained with the same per-turn
-        reward signal as the department models it routes to.
+        Selects among N departments (6-way choice) using the 22-feature state
+        vector (20 base features + food_ratio + farm count).  Trained with the
+        same per-turn reward signal as the department models it routes to.
         """
 
         def __init__(
             self,
             n_depts:   int   = 6,
-            n_inputs:  int   = 20,
+            n_inputs:  int   = 22,
             *,
             table_path:    Optional[str | Path] = None,
             epsilon:       float = 0.10,
@@ -931,7 +931,7 @@ if _TORCH_AVAILABLE:
             self,
             slug:      str,
             n_actions: int,
-            n_inputs:  int   = 20,
+            n_inputs:  int   = 22,
             *,
             table_path:    Optional[str | Path] = None,
             epsilon:       float = 0.10,

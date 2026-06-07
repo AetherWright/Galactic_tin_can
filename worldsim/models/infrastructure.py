@@ -8,6 +8,7 @@ from ..planets import (
     City,
     MilitaryBase,
     Mine,
+    Farm,
     Port,
     Factory,
     Hospital,
@@ -19,7 +20,14 @@ from ..planets import (
     NuclearFacility,
     OrbitalDefense,
 )
+from ..planets.terrain import BIOME_FARM_YIELD, BIOME_FOOD_CAP
 from ..config import load_json
+
+# Food consumed per person per simulation turn (1 turn ≈ 20 years).
+# Calibrated so natural biome regen sustains a small starting city (~5 000
+# people) without farms, while populations in the tens-of-thousands require
+# dedicated Farm buildings to stay fed.
+_FOOD_PER_PERSON: float = 0.0002
 
 if TYPE_CHECKING:
     from .nation import Nation
@@ -48,13 +56,42 @@ def collect_resources(nation: "Nation") -> None:
             continue
         gained = planet.extract_resource("energy", plant.output)
         nation.add_resource("energy", gained)
-    # biology: Synthetic Biology raises agricultural yield (food_output)
+    # Food: farms produce grain into the planet stockpile; population consumes
+    # from the same stockpile.  food_ratio = stockpile / _FOOD_ADEQUATE drives
+    # the birth/death model in city.py.
     food_mult = nation.tech_bonuses.get("food_output", 1.0)
-    for _city in nation.cities:
-        planet = PLANETS.get(_city.planet)
+    for farm in nation.farms:
+        planet = PLANETS.get(farm.planet)
         if not planet:
             continue
-        nation.add_resource("food", planet.extract_resource("food", 1.0 * food_mult))
+        yield_mult = BIOME_FARM_YIELD.get(planet.biome, 1.0)
+        cap = BIOME_FOOD_CAP.get(planet.biome, 20.0)
+        current = planet.resources.get("food", 0.0)
+        planet.resources["food"] = min(cap, current + farm.output * yield_mult * food_mult)
+
+    # Per-city consumption
+    for city in nation.cities:
+        planet = PLANETS.get(city.planet)
+        if planet:
+            planet.resources["food"] = max(
+                0.0, planet.resources.get("food", 0.0) - city.population * _FOOD_PER_PERSON
+            )
+    # Colony consumption
+    for colony in nation.colonies:
+        planet = PLANETS.get(colony.planet)
+        if planet:
+            planet.resources["food"] = max(
+                0.0, planet.resources.get("food", 0.0) - colony.population * _FOOD_PER_PERSON
+            )
+    # Rural consumption on home planet
+    home = PLANETS.get(nation.planet)
+    if home:
+        rural = sum(
+            c.rural_population for c in home.counties.values() if c.owner == nation.id
+        )
+        home.resources["food"] = max(
+            0.0, home.resources.get("food", 0.0) - rural * _FOOD_PER_PERSON
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +162,23 @@ def build_mine(nation: "Nation") -> None:
     mine = Mine(anchor.x, anchor.y, nation.planet, owner=nation.id)
     planet.add_mine(mine)
     nation.mines.append(mine)
+    nation.spend_resources(cost)
+
+
+def build_farm(nation: "Nation") -> None:
+    planet = PLANETS.get(nation.planet)
+    if not planet or not nation.cities:
+        return
+    cost = RESOURCE_COSTS["farm"]
+    if not nation.has_resources(cost):
+        return
+    anchor = max(nation.cities, key=lambda c: c.population)
+    if (anchor.x, anchor.y) in planet.farms:
+        _upgrade_at_anchor(nation, nation.farms, anchor.x, anchor.y, cost)
+        return
+    farm = Farm(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    planet.add_farm(farm)
+    nation.farms.append(farm)
     nation.spend_resources(cost)
 
 
@@ -314,6 +368,9 @@ def upgrade_assets(nation: "Nation") -> None:
         nation.economy_linear -= 15
     if nation.mines and nation.economy_linear >= 10:
         nation.mines[0].upgrade()
+        nation.economy_linear -= 10
+    if nation.farms and nation.economy_linear >= 10:
+        nation.farms[0].upgrade()
         nation.economy_linear -= 10
     if nation.ports and nation.economy_linear >= 15:
         nation.ports[0].upgrade()

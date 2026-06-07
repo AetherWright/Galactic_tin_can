@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .infrastructure import (
         MilitaryBase,
         Mine,
+        Farm,
         Port,
         Factory,
         Hospital,
@@ -43,6 +44,7 @@ from .infrastructure import (
     ResearchLab,
     NuclearFacility,
     OrbitalDefense,
+    Farm,
 )
 from ..utils import distance, travel_time, APPROXIMATE
 
@@ -90,6 +92,7 @@ class Planet:
     labs: Dict[Tuple[int, int], 'ResearchLab'] = field(default_factory=dict)
     nuke_plants: Dict[Tuple[int, int], 'NuclearFacility'] = field(default_factory=dict)
     orbital_defenses: Dict[Tuple[int, int], 'OrbitalDefense'] = field(default_factory=dict)
+    farms: Dict[Tuple[int, int], 'Farm'] = field(default_factory=dict)
     counties: Dict[Tuple[int, int], 'County'] = field(default_factory=dict)
     routes: RouteGraph = field(default_factory=RouteGraph)
     _distance_cache: Any = field(default=None, init=False, repr=False)
@@ -154,6 +157,9 @@ class Planet:
         lx = randrange(0, self.width, spacing)
         ly = randrange(0, self.height, spacing)
         self.add_lab(ResearchLab(lx, ly, self.name))
+        farmx = randrange(0, self.width, spacing)
+        farmy = randrange(0, self.height, spacing)
+        self.add_farm(Farm(farmx, farmy, self.name))
         self._cache_version = self.routes.version
 
 
@@ -488,6 +494,20 @@ class Planet:
             if (nx, ny, t) == node:
                 continue
             dist = ((mine.x - nx) ** 2 + (mine.y - ny) ** 2) ** 0.5
+            if dist <= self.spacing * 2:
+                self.routes.add_edge(node, (nx, ny, t), dist)
+        self._mark_dirty()
+
+    def add_farm(self, farm: 'Farm') -> None:
+        self.farms[(farm.x, farm.y)] = farm
+        node = (farm.x, farm.y, "farm")
+        self.routes.add_node(node)
+        for (nx, ny, t) in list(self.routes.nodes()):
+            if t not in {"city", "base", "mine", "port", "lab"}:
+                continue
+            if (nx, ny, t) == node:
+                continue
+            dist = ((farm.x - nx) ** 2 + (farm.y - ny) ** 2) ** 0.5
             if dist <= self.spacing * 2:
                 self.routes.add_edge(node, (nx, ny, t), dist)
         self._mark_dirty()
