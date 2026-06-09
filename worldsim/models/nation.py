@@ -7,7 +7,10 @@ import random
 import asyncio
 import math
 
-from ..ai import DomesticPolicyAI, ProjectAI, DiplomacyAI, ResearchAI, WarAI
+from ..ai import (
+    DomesticPolicyAI, ProjectAI, DiplomacyAI, ResearchAI, WarAI,
+    CivilianOverseerAI, DepartmentPolicyAI,
+)
 from .diplomacy import (
     Message,
     can_communicate,
@@ -52,6 +55,7 @@ from ..planets import (
     ResearchLab,
     MilitaryBase,
     Mine,
+    Farm,
     Port,
     Factory,
     Hospital,
@@ -91,6 +95,7 @@ from .infrastructure import (
     build_city          as _infra_build_city,
     build_base          as _infra_build_base,
     build_mine          as _infra_build_mine,
+    build_farm          as _infra_build_farm,
     build_port          as _infra_build_port,
     build_factory       as _infra_build_factory,
     build_hospital      as _infra_build_hospital,
@@ -105,12 +110,15 @@ from .infrastructure import (
     colonize_planet     as _infra_colonize_planet,
 )
 from .civilian_controller import (
-    _civilian_state        as _cc_civilian_state,
+    _civilian_state          as _cc_civilian_state,
     _execute_civilian_action as _cc_execute_civilian_action,
-    _valid_action_mask     as _cc_valid_action_mask,
-    _apply_civilian_ai     as _cc_apply_civilian_ai,
+    _valid_action_mask       as _cc_valid_action_mask,
+    _apply_civilian_ai       as _cc_apply_civilian_ai,
     _random_civilian_actions as _cc_random_civilian_actions,
-    process_action_queue   as _cc_process_action_queue,
+    process_action_queue     as _cc_process_action_queue,
+    CivilianController,
+    DEPARTMENTS,
+    N_CIVILIAN_DEPARTMENTS,
 )
 
 
@@ -164,6 +172,7 @@ class Nation:
     cities: List[City] = field(default_factory=list)
     bases: List[MilitaryBase] = field(default_factory=list)
     mines: List[Mine] = field(default_factory=list)
+    farms: List[Farm] = field(default_factory=list)
     ports: List[Port] = field(default_factory=list)
     factories: List[Factory] = field(default_factory=list)
     hospitals: List[Hospital] = field(default_factory=list)
@@ -251,7 +260,8 @@ class Nation:
             from ..torch_rnn import (
                 rnn_available,
                 TorchWarAI,
-                TorchDomesticPolicyAI,
+                TorchCivilianOverseer,
+                TorchDepartmentAI,
                 TorchProjectAI,
                 TorchDiplomacyAI,
                 TorchResearchAI,
@@ -265,8 +275,17 @@ class Nation:
             self.military_ai  = TorchWarAI(
                 allies_dim=ally_dim, table_path=military_path
             )
-            self.civilian_ai  = TorchDomesticPolicyAI(
-                21, n_inputs=20, table_path=civilian_path
+            self.civilian_ai  = CivilianController(
+                overseer=TorchCivilianOverseer(
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22,
+                ),
+                dept_models={
+                    dept.slug: TorchDepartmentAI(
+                        dept.slug, dept.n_actions, n_inputs=22,
+                    )
+                    for dept in DEPARTMENTS
+                },
+                base_table_path=civilian_path,
             )
             self.project_ai   = TorchProjectAI(
                 len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
@@ -280,10 +299,17 @@ class Nation:
             self.doctrine_ai  = TorchDoctrineAI(table_path=doctrine_path)
         else:
             self.military_ai  = WarAI(allies_dim=ally_dim, table_path=military_path)
-            self.civilian_ai  = DomesticPolicyAI(
-                21, n_inputs=20,
-                hidden_layers=(32, 24, 16, 10, 8, 7, 7, 8, 10, 16, 24, 32),
-                table_path=civilian_path,
+            self.civilian_ai  = CivilianController(
+                overseer=CivilianOverseerAI(
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22,
+                ),
+                dept_models={
+                    dept.slug: DepartmentPolicyAI(
+                        dept.slug, dept.n_actions, n_inputs=22,
+                    )
+                    for dept in DEPARTMENTS
+                },
+                base_table_path=civilian_path,
             )
             self.project_ai   = ProjectAI(
                 len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
@@ -595,6 +621,7 @@ class Nation:
             cpop = process_colony_batch(
                 self.colonies, plague_level, plague_res,
                 stability=self.stability,
+                radiation_level=radiation_level,
             )
             total_pop += cpop
 
@@ -602,7 +629,7 @@ class Nation:
         if planet is not None:
             food_ratio = min(
                 1.0,
-                planet.resources.get('food', 50.0) / 50.0,
+                planet.resources.get('food', 20.0) / 20.0,
             )
             for county in planet.counties.values():
                 if county.owner == self.id:
@@ -610,6 +637,7 @@ class Nation:
                         food_ratio=food_ratio,
                         stability=self.stability,
                     )
+                    total_pop += county.rural_population
         if _np is not None:
             if self.mines:
                 arr = _np.array([m.output for m in self.mines], dtype=float)
@@ -729,6 +757,9 @@ class Nation:
 
     def build_mine(self) -> None:
         _infra_build_mine(self)
+
+    def build_farm(self) -> None:
+        _infra_build_farm(self)
 
     def build_port(self) -> None:
         _infra_build_port(self)

@@ -20,10 +20,12 @@ _COL_FRONTIER:   float  = 0.020   # strong pioneer bonus at low density
 _COL_BASE_DEATH: float  = 0.014   # higher baseline mortality (frontier conditions)
 _COL_DISEASE_POW: float = 1.5     # same super-linear plague response as cities
 _COL_DISEASE_SCALE: float = 0.15
-_COL_STARVE_THRESH: float = 0.40  # colonies are more resilient to mild food stress
-_COL_STARVE_MAX: float   = 0.08
+_COL_STARVE_THRESH: float = 0.30  # colonies are more resilient to mild food stress
+_COL_STARVE_MAX: float   = 0.04
+_COL_RAD_MORT_SCALE: float = 0.08  # radiation mortality — same scale as cities
+_COL_RAD_FERT_SCALE: float = 0.40  # radiation fertility penalty (floor: 50 %)
 _COL_CAP: int            = 8_000  # colony population ceiling before city graduation
-_COL_FOOD_ADEQUATE: float = 50.0  # food units = fully adequate (matches city constant)
+_COL_FOOD_ADEQUATE: float = 20.0  # food units = fully adequate (matches city constant)
 
 
 @dataclass
@@ -43,18 +45,21 @@ class Colony:
     def process_turn(self, plague_resist: float = 0.0, stability: float = 75.0) -> None:
         """Advance one turn using the pioneer-settlement birth/death model."""
         planet = PLANETS.get(self.planet)
-        plague_level    = planet.plague_level    if planet else 0.0
-        food_ratio      = min(1.0, planet.resources.get('food', _COL_FOOD_ADEQUATE) / _COL_FOOD_ADEQUATE) if planet else 1.0
+        plague_level     = planet.plague_level     if planet else 0.0
+        radiation_level  = planet.radiation_level  if planet else 0.0
+        food_ratio       = min(1.0, planet.resources.get('food', _COL_FOOD_ADEQUATE) / _COL_FOOD_ADEQUATE) if planet else 1.0
 
         density     = self.population / _COL_CAP
         frontier    = max(0.0, _COL_FRONTIER * (1.0 - min(density, 1.0) * 1.5))
         stab_mod    = 0.5 + 0.5 * (stability / 100.0)
         food_birth  = 0.3 + 0.7 * food_ratio
-        birth_rate  = (_COL_BASE_BIRTH + frontier) * stab_mod * food_birth
+        rad_fert    = max(0.5, 1.0 - radiation_level * _COL_RAD_FERT_SCALE)
+        birth_rate  = (_COL_BASE_BIRTH + frontier) * stab_mod * food_birth * rad_fert
 
         disease_mort = (plague_level ** _COL_DISEASE_POW) * _COL_DISEASE_SCALE * (1.0 - plague_resist)
+        rad_mort     = radiation_level * _COL_RAD_MORT_SCALE
         starve_mort  = max(0.0, (_COL_STARVE_THRESH - food_ratio) * _COL_STARVE_MAX / _COL_STARVE_THRESH)
-        total_mort   = _COL_BASE_DEATH + disease_mort + starve_mort
+        total_mort   = _COL_BASE_DEATH + disease_mort + rad_mort + starve_mort
 
         net = birth_rate - total_mort
         self.population = max(0, min(_COL_CAP, int(self.population * (1.0 + net))))
@@ -68,6 +73,7 @@ def process_colony_batch(
     plague_level: float,
     plague_resist: float,
     stability: float = 75.0,
+    radiation_level: float = 0.0,
 ) -> int:
     """Vectorised birth/death update for pioneer colonies.
 
@@ -99,11 +105,13 @@ def process_colony_batch(
         frontier   = _np.maximum(0.0, _COL_FRONTIER * (1.0 - _np.minimum(density, 1.0) * 1.5))
         stab_mod   = 0.5 + 0.5 * (stability / 100.0)
         food_birth = 0.3 + 0.7 * food_arr
-        birth_rate = (_COL_BASE_BIRTH + frontier) * stab_mod * food_birth
+        rad_fert   = max(0.5, 1.0 - radiation_level * _COL_RAD_FERT_SCALE)
+        birth_rate = (_COL_BASE_BIRTH + frontier) * stab_mod * food_birth * rad_fert
 
         disease_mort = (plague_level ** _COL_DISEASE_POW) * _COL_DISEASE_SCALE * (1.0 - plague_resist)
+        rad_mort     = radiation_level * _COL_RAD_MORT_SCALE
         starve_mort  = _np.maximum(0.0, (_COL_STARVE_THRESH - food_arr) * _COL_STARVE_MAX / _COL_STARVE_THRESH)
-        total_mort   = _COL_BASE_DEATH + disease_mort + starve_mort
+        total_mort   = _COL_BASE_DEATH + disease_mort + rad_mort + starve_mort
 
         net  = birth_rate - total_mort
         pops = _np.minimum(_COL_CAP, _np.maximum(0.0, pops * (1.0 + net)))

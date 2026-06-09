@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Set
@@ -287,7 +288,7 @@ def _colony_available(col: Colony, planet: Planet) -> bool:
     return all(
         coord not in getattr(planet, attr, {})
         for attr in (
-            "factories", "hospitals", "mines", "ports",
+            "factories", "hospitals", "mines", "farms", "ports",
             "power_plants", "labs", "schools", "bases",
             "shipyards", "spaceports", "nuke_plants", "orbital_defenses"
         )

@@ -8,6 +8,7 @@ from ..planets import (
     City,
     MilitaryBase,
     Mine,
+    Farm,
     Port,
     Factory,
     Hospital,
@@ -19,7 +20,14 @@ from ..planets import (
     NuclearFacility,
     OrbitalDefense,
 )
+from ..planets.terrain import BIOME_FARM_YIELD, BIOME_FOOD_CAP
 from ..config import load_json
+
+# Food consumed per person per simulation turn (1 turn ≈ 20 years).
+# Calibrated so natural biome regen sustains a small starting city (~5 000
+# people) without farms, while populations in the tens-of-thousands require
+# dedicated Farm buildings to stay fed.
+_FOOD_PER_PERSON: float = 0.0002
 
 if TYPE_CHECKING:
     from .nation import Nation
@@ -48,29 +56,47 @@ def collect_resources(nation: "Nation") -> None:
             continue
         gained = planet.extract_resource("energy", plant.output)
         nation.add_resource("energy", gained)
-    # biology: Synthetic Biology raises agricultural yield (food_output)
+    # Food: farms produce grain into the planet stockpile; population consumes
+    # from the same stockpile.  food_ratio = stockpile / _FOOD_ADEQUATE drives
+    # the birth/death model in city.py.
     food_mult = nation.tech_bonuses.get("food_output", 1.0)
-    for _city in nation.cities:
-        planet = PLANETS.get(_city.planet)
+    for farm in nation.farms:
+        planet = PLANETS.get(farm.planet)
         if not planet:
             continue
-        nation.add_resource("food", planet.extract_resource("food", 5.0 * food_mult))
+        yield_mult = BIOME_FARM_YIELD.get(planet.biome, 1.0)
+        cap = BIOME_FOOD_CAP.get(planet.biome, 20.0)
+        current = planet.resources.get("food", 0.0)
+        planet.resources["food"] = min(cap, current + farm.output * yield_mult * food_mult)
+
+    # Per-city consumption
+    for city in nation.cities:
+        planet = PLANETS.get(city.planet)
+        if planet:
+            planet.resources["food"] = max(
+                0.0, planet.resources.get("food", 0.0) - city.population * _FOOD_PER_PERSON
+            )
+    # Colony consumption
+    for colony in nation.colonies:
+        planet = PLANETS.get(colony.planet)
+        if planet:
+            planet.resources["food"] = max(
+                0.0, planet.resources.get("food", 0.0) - colony.population * _FOOD_PER_PERSON
+            )
+    # Rural consumption on home planet
+    home = PLANETS.get(nation.planet)
+    if home:
+        rural = sum(
+            c.rural_population for c in home.counties.values() if c.owner == nation.id
+        )
+        home.resources["food"] = max(
+            0.0, home.resources.get("food", 0.0) - rural * _FOOD_PER_PERSON
+        )
 
 
 # ---------------------------------------------------------------------------
 # Build methods
 # ---------------------------------------------------------------------------
-
-def _upgrade_at_anchor(nation: "Nation", owned: list, ax: int, ay: int, cost) -> None:
-    """Upgrade the nation's own structure at (ax, ay) and spend resources.
-
-    Called when a build_ function detects the target coord is already occupied.
-    If the slot belongs to another nation nothing happens (no spend, no upgrade).
-    """
-    existing = next((s for s in owned if s.x == ax and s.y == ay), None)
-    if existing:
-        existing.upgrade()
-        nation.spend_resources(cost)
 
 def build_city(nation: "Nation") -> None:
     planet = PLANETS.get(nation.planet)
@@ -102,10 +128,10 @@ def build_base(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.bases:
-        _upgrade_at_anchor(nation, nation.bases, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    base = MilitaryBase(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    base = MilitaryBase(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_base(base)
     nation.bases.append(base)
     nation.spend_resources(cost)
@@ -119,12 +145,29 @@ def build_mine(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.mines:
-        _upgrade_at_anchor(nation, nation.mines, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    mine = Mine(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    mine = Mine(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_mine(mine)
     nation.mines.append(mine)
+    nation.spend_resources(cost)
+
+
+def build_farm(nation: "Nation") -> None:
+    planet = PLANETS.get(nation.planet)
+    if not planet or not nation.cities:
+        return
+    cost = RESOURCE_COSTS["farm"]
+    if not nation.has_resources(cost):
+        return
+    anchor = max(nation.cities, key=lambda c: c.population)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
+        return
+    farm = Farm(spot[0], spot[1], nation.planet, owner=nation.id)
+    planet.add_farm(farm)
+    nation.farms.append(farm)
     nation.spend_resources(cost)
 
 
@@ -136,10 +179,10 @@ def build_port(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.ports:
-        _upgrade_at_anchor(nation, nation.ports, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    port = Port(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    port = Port(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_port(port)
     nation.ports.append(port)
     nation.spend_resources(cost)
@@ -153,10 +196,10 @@ def build_factory(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.factories:
-        _upgrade_at_anchor(nation, nation.factories, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    fac = Factory(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    fac = Factory(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_factory(fac)
     nation.factories.append(fac)
     nation.spend_resources(cost)
@@ -170,10 +213,10 @@ def build_hospital(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.hospitals:
-        _upgrade_at_anchor(nation, nation.hospitals, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    hos = Hospital(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    hos = Hospital(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_hospital(hos)
     nation.hospitals.append(hos)
     nation.spend_resources(cost)
@@ -187,10 +230,10 @@ def build_shipyard(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.shipyards:
-        _upgrade_at_anchor(nation, nation.shipyards, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    yard = Shipyard(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    yard = Shipyard(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_shipyard(yard)
     nation.shipyards.append(yard)
     nation.spend_resources(cost)
@@ -204,10 +247,10 @@ def build_school(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.schools:
-        _upgrade_at_anchor(nation, nation.schools, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    school = School(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    school = School(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_school(school)
     nation.schools.append(school)
     nation.spend_resources(cost)
@@ -221,10 +264,10 @@ def build_power_plant(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.power_plants:
-        _upgrade_at_anchor(nation, nation.power_plants, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    plant = PowerPlant(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    plant = PowerPlant(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_power_plant(plant)
     nation.power_plants.append(plant)
     nation.spend_resources(cost)
@@ -238,10 +281,10 @@ def build_lab(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.labs:
-        _upgrade_at_anchor(nation, nation.labs, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    lab = ResearchLab(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    lab = ResearchLab(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_lab(lab)
     nation.labs.append(lab)
     nation.spend_resources(cost)
@@ -255,10 +298,10 @@ def build_nuke_facility(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.nuke_plants:
-        _upgrade_at_anchor(nation, nation.nuke_plants, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    fac = NuclearFacility(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    fac = NuclearFacility(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_nuke_facility(fac)
     nation.nuke_plants.append(fac)
     nation.spend_resources(cost)
@@ -272,10 +315,10 @@ def build_orbital_defense(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.orbital_defenses:
-        _upgrade_at_anchor(nation, nation.orbital_defenses, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    od = OrbitalDefense(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    od = OrbitalDefense(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_orbital_defense(od)
     nation.orbital_defenses.append(od)
     nation.spend_resources(cost)
@@ -289,10 +332,10 @@ def build_spaceport(nation: "Nation") -> None:
     if not nation.has_resources(cost):
         return
     anchor = max(nation.cities, key=lambda c: c.population)
-    if (anchor.x, anchor.y) in planet.spaceports:
-        _upgrade_at_anchor(nation, nation.spaceports, anchor.x, anchor.y, cost)
+    spot = planet.find_building_spot(anchor.x, anchor.y)
+    if spot is None:
         return
-    port = Spaceport(anchor.x, anchor.y, nation.planet, owner=nation.id)
+    port = Spaceport(spot[0], spot[1], nation.planet, owner=nation.id)
     planet.add_spaceport(port)
     nation.spaceports.append(port)
     nation.spend_resources(cost)
@@ -314,6 +357,9 @@ def upgrade_assets(nation: "Nation") -> None:
         nation.economy_linear -= 15
     if nation.mines and nation.economy_linear >= 10:
         nation.mines[0].upgrade()
+        nation.economy_linear -= 10
+    if nation.farms and nation.economy_linear >= 10:
+        nation.farms[0].upgrade()
         nation.economy_linear -= 10
     if nation.ports and nation.economy_linear >= 15:
         nation.ports[0].upgrade()
@@ -342,11 +388,30 @@ def upgrade_assets(nation: "Nation") -> None:
 
 
 def colonize_planet(nation: "Nation") -> None:
-    """Attempt to found a city on another planet if one is free."""
+    """Attempt to found a city on another planet if one is free.
+
+    For planets the nation already has a city on, no fleet is needed.
+    For entirely new planets, an idle Transport fleet must already be
+    present at that planet's location.
+    """
+    owned_planets = {c.planet for c in nation.cities}
     candidates = []
     for planet in PLANETS.values():
         free = [c for c in planet.iter_colonies() if c.owner is None]
-        if free:
+        if not free:
+            continue
+        if planet.name in owned_planets:
+            # Nation already has a foothold here — no fleet needed
+            candidates.append((planet, free))
+            continue
+        # New planet — require an idle Transport fleet present there
+        has_transport = any(
+            f.location == planet.name
+            and f.mission == "idle"
+            and f.ships.get("Transport", 0) > 0
+            for f in nation.fleets
+        )
+        if has_transport:
             candidates.append((planet, free))
     if not candidates:
         return

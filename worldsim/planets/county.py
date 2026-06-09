@@ -8,11 +8,14 @@ if TYPE_CHECKING:
 from ..ideas import Idea
 
 
-# Rural demographic constants (lower rates than urban; less healthcare access).
-_RURAL_BASE_BIRTH: float = 0.020   # per turn (~1 % per 20-year period)
-_RURAL_BASE_DEATH: float = 0.013   # slightly higher natural mortality than cities
-_RURAL_STARVE_THRESH: float = 0.40 # food_ratio below which starvation sets in
-_RURAL_STARVE_MAX: float   = 0.06  # maximum starvation mortality
+# Rural demographic constants.  Rural areas have higher base fertility than
+# settled cities (traditional high-birth agrarian communities) but no hospital
+# access, so natural mortality is slightly higher than urban.
+_RURAL_BASE_BIRTH: float = 0.025   # per turn; higher than settled urban (0.020)
+_RURAL_BASE_DEATH: float = 0.013   # slightly higher natural mortality than cities (no hospitals)
+_RURAL_STARVE_THRESH: float = 0.30 # food_ratio below which starvation sets in
+_RURAL_STARVE_MAX: float   = 0.03  # maximum starvation mortality
+_RURAL_INSTABILITY_SCALE: float = 0.005  # max extra mortality per turn at stability=0
 
 
 @dataclass
@@ -86,7 +89,8 @@ class County:
             0.0,
             (_RURAL_STARVE_THRESH - food_ratio) * _RURAL_STARVE_MAX / _RURAL_STARVE_THRESH,
         )
-        total_mort  = _RURAL_BASE_DEATH + starve_mort
+        instability_mort = max(0.0, (50.0 - stability) / 50.0 * _RURAL_INSTABILITY_SCALE)
+        total_mort  = _RURAL_BASE_DEATH + starve_mort + instability_mort
 
         net = birth_rate - total_mort
         self.rural_population = max(0, int(self.rural_population * (1.0 + net)))

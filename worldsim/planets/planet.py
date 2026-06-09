@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, Tuple, TYPE_CHECKING, Any, Iterator
+from typing import Dict, Optional, Set, Tuple, TYPE_CHECKING, Any, Iterator
 from collections import defaultdict
 import random
 
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .infrastructure import (
         MilitaryBase,
         Mine,
+        Farm,
         Port,
         Factory,
         Hospital,
@@ -43,6 +44,7 @@ from .infrastructure import (
     ResearchLab,
     NuclearFacility,
     OrbitalDefense,
+    Farm,
 )
 from ..utils import distance, travel_time, APPROXIMATE
 
@@ -90,6 +92,7 @@ class Planet:
     labs: Dict[Tuple[int, int], 'ResearchLab'] = field(default_factory=dict)
     nuke_plants: Dict[Tuple[int, int], 'NuclearFacility'] = field(default_factory=dict)
     orbital_defenses: Dict[Tuple[int, int], 'OrbitalDefense'] = field(default_factory=dict)
+    farms: Dict[Tuple[int, int], 'Farm'] = field(default_factory=dict)
     counties: Dict[Tuple[int, int], 'County'] = field(default_factory=dict)
     routes: RouteGraph = field(default_factory=RouteGraph)
     _distance_cache: Any = field(default=None, init=False, repr=False)
@@ -154,6 +157,9 @@ class Planet:
         lx = randrange(0, self.width, spacing)
         ly = randrange(0, self.height, spacing)
         self.add_lab(ResearchLab(lx, ly, self.name))
+        farmx = randrange(0, self.width, spacing)
+        farmy = randrange(0, self.height, spacing)
+        self.add_farm(Farm(farmx, farmy, self.name))
         self._cache_version = self.routes.version
 
 
@@ -227,12 +233,51 @@ class Planet:
             self.routes.end_batch_update()
             self._mark_dirty()
 
-    def _add_colony(self, x: int, y: int) -> 'Colony':
-        """Create a colony at ``(x, y)`` if missing and wire it into routes."""
+    def _all_occupied_coords(self) -> Set[Tuple[int, int]]:
+        """Return all grid positions that already hold any structure."""
+        occupied: Set[Tuple[int, int]] = set()
+        for store in (
+            self.cities, self.colonies, self.bases, self.mines, self.farms,
+            self.ports, self.factories, self.hospitals, self.shipyards,
+            self.spaceports, self.schools, self.power_plants, self.labs,
+            self.nuke_plants, self.orbital_defenses,
+        ):
+            occupied.update(store.keys())
+        return occupied
 
+    def find_building_spot(self, near_x: int, near_y: int) -> Optional[Tuple[int, int]]:
+        """Return the nearest unoccupied grid position to (near_x, near_y)."""
+        occupied = self._all_occupied_coords()
+        spacing = self.spacing
+        positions = [
+            (x, y)
+            for x in range(0, self.width, spacing)
+            for y in range(0, self.height, spacing)
+        ]
+        positions.sort(key=lambda p: (p[0] - near_x) ** 2 + (p[1] - near_y) ** 2)
+        for pos in positions:
+            if pos not in occupied:
+                return pos
+        return None
+
+    def _add_colony(self, x: int, y: int) -> Optional['Colony']:
+        """Create a colony at ``(x, y)`` if missing and wire it into routes.
+
+        Returns None if the position is already occupied by a city or building.
+        """
         key = (x, y)
         colony = self.colonies.get(key)
         if colony is None:
+            if key in self.cities:
+                return None
+            for store in (
+                self.bases, self.mines, self.farms, self.ports,
+                self.factories, self.hospitals, self.shipyards,
+                self.spaceports, self.schools, self.power_plants,
+                self.labs, self.nuke_plants, self.orbital_defenses,
+            ):
+                if key in store:
+                    return None
             colony = Colony(x, y, self.name)
             self.colonies[key] = colony
             self.routes.add_node((x, y, "city"))
@@ -388,7 +433,7 @@ class Planet:
             cap = float(rng[1])
             current = self.resources.get(resource, 0.0)
             if current < cap:
-                regen = cap * 0.02  # 2% of cap per turn
+                regen = cap * 0.05  # 5% of cap per turn
                 self.resources[resource] = min(cap, current + regen)
     def _compute_distance(
         self, a: Tuple[int, int, str], b: Tuple[int, int, str]
@@ -488,6 +533,20 @@ class Planet:
             if (nx, ny, t) == node:
                 continue
             dist = ((mine.x - nx) ** 2 + (mine.y - ny) ** 2) ** 0.5
+            if dist <= self.spacing * 2:
+                self.routes.add_edge(node, (nx, ny, t), dist)
+        self._mark_dirty()
+
+    def add_farm(self, farm: 'Farm') -> None:
+        self.farms[(farm.x, farm.y)] = farm
+        node = (farm.x, farm.y, "farm")
+        self.routes.add_node(node)
+        for (nx, ny, t) in list(self.routes.nodes()):
+            if t not in {"city", "base", "mine", "port", "lab"}:
+                continue
+            if (nx, ny, t) == node:
+                continue
+            dist = ((farm.x - nx) ** 2 + (farm.y - ny) ** 2) ** 0.5
             if dist <= self.spacing * 2:
                 self.routes.add_edge(node, (nx, ny, t), dist)
         self._mark_dirty()
@@ -637,7 +696,7 @@ class Planet:
 
     def upgrade_colony(self, colony: 'Colony', owner: int) -> 'City':
         """Replace ``colony`` with a fully fledged city."""
-        city = City(colony.x, colony.y, self.name, owner=owner, population=5000)
+        city = City(colony.x, colony.y, self.name, owner=owner, population=colony.population)
         self.cities[(colony.x, colony.y)] = city
         self.colonies.pop((colony.x, colony.y), None)
         county = self.get_county(colony.x, colony.y)

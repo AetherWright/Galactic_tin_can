@@ -281,7 +281,7 @@ if _TORCH_AVAILABLE:
         for nation in nations.values():                          # type: ignore[attr-defined]
             for attr, ga_key in _attr_role_ga:
                 ctrl = getattr(nation, attr, None)
-                if not isinstance(ctrl, RNNController):
+                if not hasattr(ctrl, "sync_meta_ga"):
                     continue
                 ga = nation.reward_ga.get(ga_key)               # type: ignore[attr-defined]
                 if ga is not None:
@@ -896,6 +896,54 @@ if _TORCH_AVAILABLE:
             )
 
 
+    class TorchCivilianOverseer(_RoleController):
+        """Overseer model that routes to one of the civilian departments.
+
+        Selects among N departments (6-way choice) using the 22-feature state
+        vector (20 base features + food_ratio + farm count).  Trained with the
+        same per-turn reward signal as the department models it routes to.
+        """
+
+        def __init__(
+            self,
+            n_depts:   int   = 6,
+            n_inputs:  int   = 22,
+            *,
+            table_path:    Optional[str | Path] = None,
+            epsilon:       float = 0.10,
+            gamma:         float = 0.95,
+        ) -> None:
+            super().__init__(
+                "civilian_overseer", n_inputs, n_depts, 64,
+                table_path=table_path, epsilon=epsilon, gamma=gamma,
+            )
+
+
+    class TorchDepartmentAI(_RoleController):
+        """Department-level model handling one civilian department's local actions.
+
+        Each department gets its own shared base model (role key
+        ``"civilian_{slug}"``), so departments specialise independently while
+        nations within a department still share the same backbone.
+        """
+
+        def __init__(
+            self,
+            slug:      str,
+            n_actions: int,
+            n_inputs:  int   = 22,
+            *,
+            table_path:    Optional[str | Path] = None,
+            epsilon:       float = 0.10,
+            gamma:         float = 0.95,
+        ) -> None:
+            super().__init__(
+                f"civilian_{slug}", n_inputs, n_actions, 64,
+                table_path=table_path, epsilon=epsilon, gamma=gamma,
+            )
+            self.slug = slug
+
+
     class TorchProjectAI(_RoleController):
         """RNN+LoRA replacement for :class:`~worldsim.ai.ProjectAI`."""
 
@@ -1017,15 +1065,17 @@ else:
     # -----------------------------------------------------------------------
     # Stubs — imported safely when torch is absent
     # -----------------------------------------------------------------------
-    RNNController         = None   # type: ignore[assignment,misc]
-    RoleBaseModel         = None   # type: ignore[assignment,misc]
-    TorchWarAI            = None   # type: ignore[assignment,misc]
-    TorchDomesticPolicyAI = None   # type: ignore[assignment,misc]
-    TorchProjectAI        = None   # type: ignore[assignment,misc]
-    TorchDiplomacyAI      = None   # type: ignore[assignment,misc]
-    TorchResearchAI       = None   # type: ignore[assignment,misc]
-    TorchDoctrineAI       = None   # type: ignore[assignment,misc]
-    TorchFleetController  = None   # type: ignore[assignment,misc]
+    RNNController          = None   # type: ignore[assignment,misc]
+    RoleBaseModel          = None   # type: ignore[assignment,misc]
+    TorchWarAI             = None   # type: ignore[assignment,misc]
+    TorchDomesticPolicyAI  = None   # type: ignore[assignment,misc]
+    TorchCivilianOverseer  = None   # type: ignore[assignment,misc]
+    TorchDepartmentAI      = None   # type: ignore[assignment,misc]
+    TorchProjectAI         = None   # type: ignore[assignment,misc]
+    TorchDiplomacyAI       = None   # type: ignore[assignment,misc]
+    TorchResearchAI        = None   # type: ignore[assignment,misc]
+    TorchDoctrineAI        = None   # type: ignore[assignment,misc]
+    TorchFleetController   = None   # type: ignore[assignment,misc]
 
     def get_role_model(*_a: object, **_kw: object) -> None:   # type: ignore[return]
         return None

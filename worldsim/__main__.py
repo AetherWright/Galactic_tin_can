@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> None:
     """Run a WorldSim simulation from the command line."""
     parser = argparse.ArgumentParser(description="Run a WorldSim simulation")
     parser.add_argument("--nations", type=int, default=5, help="number of nations")
-    parser.add_argument("--turns", type=int, default=50, help="years to run")
+    parser.add_argument("--turns", type=int, default=50, help="simulation turns to run (1 turn ≈ 20 sim years)")
     parser.add_argument(
         "--max-seconds",
         type=float,
