@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, Tuple, TYPE_CHECKING, Any, Iterator
+from typing import Dict, Optional, Set, Tuple, TYPE_CHECKING, Any, Iterator
 from collections import defaultdict
 import random
 
@@ -233,12 +233,51 @@ class Planet:
             self.routes.end_batch_update()
             self._mark_dirty()
 
-    def _add_colony(self, x: int, y: int) -> 'Colony':
-        """Create a colony at ``(x, y)`` if missing and wire it into routes."""
+    def _all_occupied_coords(self) -> Set[Tuple[int, int]]:
+        """Return all grid positions that already hold any structure."""
+        occupied: Set[Tuple[int, int]] = set()
+        for store in (
+            self.cities, self.colonies, self.bases, self.mines, self.farms,
+            self.ports, self.factories, self.hospitals, self.shipyards,
+            self.spaceports, self.schools, self.power_plants, self.labs,
+            self.nuke_plants, self.orbital_defenses,
+        ):
+            occupied.update(store.keys())
+        return occupied
 
+    def find_building_spot(self, near_x: int, near_y: int) -> Optional[Tuple[int, int]]:
+        """Return the nearest unoccupied grid position to (near_x, near_y)."""
+        occupied = self._all_occupied_coords()
+        spacing = self.spacing
+        positions = [
+            (x, y)
+            for x in range(0, self.width, spacing)
+            for y in range(0, self.height, spacing)
+        ]
+        positions.sort(key=lambda p: (p[0] - near_x) ** 2 + (p[1] - near_y) ** 2)
+        for pos in positions:
+            if pos not in occupied:
+                return pos
+        return None
+
+    def _add_colony(self, x: int, y: int) -> Optional['Colony']:
+        """Create a colony at ``(x, y)`` if missing and wire it into routes.
+
+        Returns None if the position is already occupied by a city or building.
+        """
         key = (x, y)
         colony = self.colonies.get(key)
         if colony is None:
+            if key in self.cities:
+                return None
+            for store in (
+                self.bases, self.mines, self.farms, self.ports,
+                self.factories, self.hospitals, self.shipyards,
+                self.spaceports, self.schools, self.power_plants,
+                self.labs, self.nuke_plants, self.orbital_defenses,
+            ):
+                if key in store:
+                    return None
             colony = Colony(x, y, self.name)
             self.colonies[key] = colony
             self.routes.add_node((x, y, "city"))
