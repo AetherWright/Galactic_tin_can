@@ -36,7 +36,7 @@ import torch
 # ---------------------------------------------------------------------------
 # Import the module under test
 # ---------------------------------------------------------------------------
-from worldsim.torch_rnn import (
+from worldsim.ai.rnn import (
     BUFFER_SIZE,
     _DOCTRINE_LIST,
     _FLEET_STATE_LIST,
@@ -59,7 +59,7 @@ from worldsim.torch_rnn import (
     _REGISTRY,
     _REGISTRY_LOCK,
 )
-from worldsim.meta_ga import RewardGA
+from worldsim.ai.meta_ga import RewardGA
 
 # ---------------------------------------------------------------------------
 # Constants used across tests
@@ -727,7 +727,7 @@ class TestRoleWrappers:
     # ----- TorchDoctrineAI -----
     def test_doctrine_ai_choose_doctrine_valid(self):
         ai = TorchDoctrineAI(epsilon=0.0)
-        from worldsim.models.military_ai import DOCTRINE_LIST
+        from worldsim.military.command import DOCTRINE_LIST
         state = [0.5] * 10
         ai.predict(state)   # advance buffer
         doctrine = ai.choose_doctrine(state)

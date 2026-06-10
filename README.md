@@ -6,27 +6,83 @@ form alliances, and colonise star systems across a procedurally generated univer
 
 ## Architecture overview
 
+The simulation is decomposed into *arms* — one package per domain:
+
 ```
 worldsim/
-├── simulation.py        — main century loop (run_simulation / SimulationLoop)
-├── models/
-│   ├── nation.py        — nation state, process_turn(), AI wiring
+├── core/                — foundations shared by every arm
+│   ├── backend.py       — NumPy/CuPy array backend selection
+│   ├── native.py        — optional Rust/C++ accelerator loading
+│   ├── flags.py         — runtime toggles (VERBOSE, APPROXIMATE, watch)
+│   ├── geometry.py      — distance, travel time, polygon helpers
+│   ├── growth.py        — logistic growth (demographic workhorse)
+│   ├── parallel.py      — shared process/thread pools
+│   ├── routing.py       — weighted route graphs (Rust-accelerated)
+│   └── timing.py        — wall-clock guards
+├── ai/                  — every learning component
+│   ├── perceptron.py    — SimplePerceptron (CPU)
+│   ├── networks.py      — sparse bidirectional LayeredNetwork
+│   ├── nelder_mead.py   — simplex minimiser
+│   ├── policy.py        — NelderMeadPolicy base class
+│   ├── roles.py         — per-role facades (WarAI, DiplomacyAI, …)
+│   ├── strategic.py     — StrategicNelderMeadAI planner
+│   ├── rnn/             — GRU base models + per-nation LoRA adapters
+│   │   ├── base.py      — shared backbones, registry, replay training
+│   │   ├── controller.py— RNNController (Double DQN + MetaGA)
+│   │   └── roles.py     — Torch role wrappers
+│   ├── torch_fleet.py   — MLP fleet controller
+│   ├── gpu.py           — CuPy-accelerated twin of the Nelder-Mead stack
+│   ├── neat.py/graph.py — NEAT topology evolution
+│   ├── meta_ga.py       — reward-weight genetic algorithm
+│   ├── embeddings.py    — action embeddings
+│   ├── representations.py — galactic state tensors for controllers
+│   └── persistence.py   — cross-run model merging and seeding
+├── galaxy/              — astrography
+│   ├── star.py          — Star model + STARS registry
+│   ├── genesis.py       — star-cluster generation, init_world
+│   └── settling.py      — initial nation placement
+├── planets/             — planetary surfaces and population
+│   ├── planet.py        — planet state and settlement pipeline
+│   ├── terrain.py       — biome definitions and resource tables
+│   ├── surface/         — noise, heightmaps, resource/atmosphere maps, storms
+│   ├── mining.py        — mine aging, terrain deformation, depletion
+│   ├── demographics/    — city / colony / county population models
+│   └── buildings.py     — physical structures on planet surfaces
+├── society/             — culture, ideas, leaders, goals
+├── nations/             — nation state and internal development
+│   ├── nation.py        — Nation dataclass, process_turn() pipeline
 │   ├── economy.py       — log-scale funds + resource stockpiles
-│   ├── military_ai.py   — fleet FSM and doctrine controllers
-│   ├── war.py           — combat resolution, nuclear strikes
-│   ├── diplomacy.py     — alliances, trade, tribute, messages
-│   └── tech.py          — technology tree with unlock effects
-├── planets/
-│   ├── city.py          — urban demographic model (birth/death)
-│   ├── colony.py        — pioneer settlement model
-│   ├── county.py        — rural population dynamics
-│   ├── planet.py        — planet state, surface generation
-│   └── heightmap.py     — fBm terrain + resource heatmaps
-├── torch_rnn.py         — GRU base models + per-nation LoRA adapters
-├── torch_ai.py          — MLP fleet controller
-├── cupy_ai.py           — CuPy-accelerated perceptron / layered network
-├── mp_utils.py          — multiprocessing and thread pool helpers
-└── utils.py             — GPU/NumPy backend selection, logistic growth
+│   ├── government.py    — government forms and approval
+│   ├── projects.py      — national project catalogue
+│   ├── construction.py  — resource collection and build actions
+│   └── civilian.py      — departmental civilian AI action space
+├── military/            — armies, fleets and doctrine
+│   ├── divisions.py     — ground divisions and recruitment
+│   ├── logistics.py     — supply, readiness, attrition, stacking
+│   ├── combat.py        — order issuing and the ground-war loop
+│   ├── nuclear.py       — warhead production and strikes
+│   ├── fleets.py        — space fleets and space combat
+│   ├── ftl.py           — FTL drive tiers
+│   ├── doctrine.py      — DoctrineSignal vocabulary + DoctrineAI
+│   └── command.py       — fleet FSM and the issue_doctrine pipeline
+├── diplomacy/           — messages, relations, war goals, peace, trade
+├── research/            — three-subsystem technology architecture
+│   ├── technology.py    — graph primitives + procedural tech generation
+│   ├── effects.py       — unlock-effect callables
+│   ├── subsystems.py    — physics / engineering / biology domains
+│   └── director.py      — point allocation across subsystems
+├── events/              — procedural events with Q-learned responses
+├── engine/              — the century loop
+│   ├── loop.py          — run_simulation / SimulationLoop
+│   ├── scoring.py       — per-century MetaGA fitness
+│   ├── reporting.py     — console summaries
+│   ├── territory.py     — planet upkeep, star ownership
+│   ├── blocs.py         — alliance blocs, border pressure
+│   ├── politics.py      — collapses, succession, civil wars
+│   └── filters.py       — great filters, zombie culling
+├── interface/           — console presentation
+├── config/              — data files and loaders
+└── native/              — Rust crates and C++ helpers
 ```
 
 ## Quick start

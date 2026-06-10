@@ -92,20 +92,20 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
 
-    from .initialization import init_world
-    from .simulation import run_simulation
+    from .galaxy import init_world
+    from .engine import run_simulation
     from .ai import set_use_neat, set_use_rust as set_rust_ai
-    from . import utils
-    from .utils import set_use_rust as set_rust_utils
-    from .routes import set_use_rust as set_rust_graph
-    from .save import merge_and_save_models, load_model_seeds
+    from .core import flags
+    from .core import set_use_rust as set_rust_core
+    from .core.routing import set_use_rust as set_rust_graph
+    from .ai.persistence import merge_and_save_models, load_model_seeds
 
     set_use_neat(args.neat)
-    utils.VERBOSE    = not args.quiet
-    utils.APPROXIMATE = args.fast
+    flags.VERBOSE     = not args.quiet
+    flags.APPROXIMATE = args.fast
     if args.no_rust:
         set_rust_ai(False)
-        set_rust_utils(False)
+        set_rust_core(False)
         set_rust_graph(False)
     nations = init_world(
         args.nations,

@@ -27,7 +27,7 @@ from typing import Dict
 import pytest
 import torch
 
-from worldsim.torch_rnn import (
+from worldsim.ai.rnn import (
     TorchWarAI,
     TorchDomesticPolicyAI,
     TorchProjectAI,
@@ -56,7 +56,7 @@ START_POP     = 2_000   # tiny: keeps turn processing fast
 
 def make_world() -> Dict:
     """Create a fresh minimal world.  Each call clears global planet/star state."""
-    from worldsim.initialization import init_world
+    from worldsim.galaxy import init_world
     return init_world(NUM_NATIONS, NUM_STARS, starting_population=START_POP)
 
 
@@ -102,7 +102,7 @@ class TestControllerTypes:
 
     def test_n_outputs_consistent_with_actions(self):
         """Each controller's n_outputs must equal the dimension it was created for."""
-        from worldsim.models.projects import PROJECT_CATALOG
+        from worldsim.nations.projects import PROJECT_CATALOG
         nations = make_world()
         for n in nations.values():
             assert n.military_ai.n_outputs  == 2
@@ -302,7 +302,7 @@ class TestBaseModelUpdate:
 class TestSimulationLoop:
     def test_simulation_loop_step_no_crash(self):
         """SimulationLoop.step() must complete one century without raising."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()   # one full century (5 fifths)
@@ -310,7 +310,7 @@ class TestSimulationLoop:
     def test_simulation_loop_calls_rnn_step(self):
         """step_all_base_models is called by SimulationLoop — verify that
         the replay buffer grows during a full century."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         civilian_base = list(nations.values())[0].civilian_ai.base
         baseline = len(civilian_base._replay)
@@ -322,7 +322,7 @@ class TestSimulationLoop:
 
     def test_two_consecutive_steps_no_crash(self):
         """Running two centuries back-to-back must not raise."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
@@ -330,7 +330,7 @@ class TestSimulationLoop:
 
     def test_lora_evolves_across_centuries(self):
         """LoRA B matrices must change over two century steps."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         n = list(nations.values())[0]
         b_before = n.civilian_ai.lora_B_out.data.clone()
@@ -347,7 +347,7 @@ class TestSimulationLoop:
 class TestPersistence:
     def test_merge_and_save_models_no_crash(self, tmp_path):
         """merge_and_save_models must not raise with torch controllers."""
-        from worldsim.save import merge_and_save_models
+        from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         for n in nations.values():
             n.process_turn(nations)   # ensure some replay data exists
@@ -355,7 +355,7 @@ class TestPersistence:
 
     def test_torch_bases_dir_created(self, tmp_path):
         """merge_and_save_models should create a torch_bases/ subdirectory."""
-        from worldsim.save import merge_and_save_models
+        from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         for n in nations.values():
             n.process_turn(nations)
@@ -366,7 +366,7 @@ class TestPersistence:
 
     def test_torch_base_files_written(self, tmp_path):
         """At least one .pt base-model file should exist after saving."""
-        from worldsim.save import merge_and_save_models
+        from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         for n in nations.values():
             n.process_turn(nations)
@@ -376,14 +376,14 @@ class TestPersistence:
 
     def test_ga_seed_written(self, tmp_path):
         """seed_ga.json must always be written."""
-        from worldsim.save import merge_and_save_models
+        from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         merge_and_save_models(nations, tmp_path)
         assert (tmp_path / "seed_ga.json").exists()
 
     def test_load_model_seeds_no_crash(self, tmp_path):
         """load_model_seeds must not raise even if only torch bases are present."""
-        from worldsim.save import merge_and_save_models, load_model_seeds
+        from worldsim.ai.persistence import merge_and_save_models, load_model_seeds
         nations = make_world()
         for n in nations.values():
             n.process_turn(nations)
@@ -395,7 +395,7 @@ class TestPersistence:
 
     def test_base_weights_restored_after_load(self, tmp_path):
         """Base model weights saved in one run must be restored in the next."""
-        from worldsim.save import merge_and_save_models, load_model_seeds
+        from worldsim.ai.persistence import merge_and_save_models, load_model_seeds
 
         nations = make_world()
         civ_base = list(nations.values())[0].civilian_ai.base
@@ -458,7 +458,7 @@ class TestSaveCompat:
     def test_merge_skips_torch_for_nelder_seed_files(self, tmp_path):
         """When using torch controllers no seed_*.yml files should be written
         (they are NelderMeadPolicy-only); only torch_bases/ and seed_ga.json."""
-        from worldsim.save import merge_and_save_models
+        from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         merge_and_save_models(nations, tmp_path)
         yml_files = [f for f in tmp_path.glob("seed_*.yml")]
@@ -469,7 +469,7 @@ class TestSaveCompat:
 
     def test_no_attribute_error_with_torch_controllers(self, tmp_path):
         """merge_and_save_models must not raise AttributeError on torch controllers."""
-        from worldsim.save import merge_and_save_models
+        from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         # Confirm all AI controllers are torch-based
         for n in nations.values():
@@ -488,7 +488,7 @@ class TestSaveCompat:
 class TestFleetControllerIntegration:
     def test_fleet_controller_is_torch(self):
         """Newly built fleets should use TorchFleetController."""
-        from worldsim.models.military_ai import make_fleet_controller
+        from worldsim.military.command import make_fleet_controller
         fc = make_fleet_controller()
         assert isinstance(fc, TorchFleetController), (
             f"make_fleet_controller returned {type(fc).__name__}, "
@@ -496,13 +496,13 @@ class TestFleetControllerIntegration:
         )
 
     def test_fleet_controller_predict_shape(self):
-        from worldsim.models.military_ai import make_fleet_controller
+        from worldsim.military.command import make_fleet_controller
         fc = make_fleet_controller()
         scores = fc.predict([0.5] * 15)
         assert len(scores) == 7
 
     def test_fleet_controller_train_no_crash(self):
-        from worldsim.models.military_ai import make_fleet_controller
+        from worldsim.military.command import make_fleet_controller
         fc = make_fleet_controller()
         s = [0.1] * 15
         fc.predict(s)
@@ -510,7 +510,7 @@ class TestFleetControllerIntegration:
 
     def test_fleet_shares_base_with_nation_fleets(self):
         """All fleet controllers in one run share the 'fleet' base model."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()   # fleets may be built during a century
@@ -552,7 +552,7 @@ class TestMetaGAIntegration:
     def test_epsilon_decreases_after_positive_century_score(self):
         """After running a century where the nation scores positively, the
         SimulationLoop.step() call should lower epsilon via sync_all_meta_ga."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         n = list(nations.values())[0]
         eps_before = n.civilian_ai.epsilon
@@ -604,14 +604,14 @@ class TestMetaGAIntegration:
 
     def test_reward_scale_influences_replay_values(self):
         """A nation with positive GA fitness should store scaled rewards."""
-        from worldsim.meta_ga import RewardGA
+        from worldsim.ai.meta_ga import RewardGA
         nations = make_world()
         n = list(nations.values())[0]
 
         # Manually boost fitness and sync
         for ga in n.reward_ga.values():
             ga.population[ga.active].fitness = 200.0
-        from worldsim.torch_rnn import sync_all_meta_ga
+        from worldsim.ai.rnn import sync_all_meta_ga
         sync_all_meta_ga(nations)
 
         assert n.civilian_ai._reward_scale > 1.0, (
@@ -621,7 +621,7 @@ class TestMetaGAIntegration:
     def test_sync_all_meta_ga_called_in_simulation_loop(self):
         """SimulationLoop.step() must update epsilon for all controllers.
         Run two centuries and verify epsilon is in valid range."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
@@ -638,7 +638,7 @@ class TestMetaGAIntegration:
 class TestNumericalHealth:
     def test_scores_finite_after_century(self):
         """All controller outputs must be finite after one century."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
@@ -651,7 +651,7 @@ class TestNumericalHealth:
 
     def test_no_nan_in_base_model_params_after_century(self):
         """Base model parameters must remain finite after a simulation century."""
-        from worldsim.simulation import SimulationLoop
+        from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
