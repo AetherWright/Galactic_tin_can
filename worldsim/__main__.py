@@ -42,6 +42,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--neat", action="store_true", help="use NEAT-based reinforcement models")
     parser.add_argument(
+        "--rust-events",
+        action="store_true",
+        help="route event decisions through the rust_events crate",
+    )
+    parser.add_argument(
         "--no-rust-events",
         action="store_true",
         help="disable Rust event helper",
@@ -133,7 +138,7 @@ def main(argv: list[str] | None = None) -> None:
             per_turn_timeout=args.timeout_per_turn,
             use_neat=args.neat,
             log_path=args.json_log,
-            use_rust_events=False if args.no_rust_events else None,
+            use_rust_events=False if args.no_rust_events else (True if args.rust_events else None),
             qtable_path=args.qtable_path,
             console=args.console,
         )
@@ -150,7 +155,7 @@ def main(argv: list[str] | None = None) -> None:
             per_turn_timeout=args.timeout_per_turn,
             use_neat=args.neat,
             log_path=args.json_log,
-            use_rust_events=False if args.no_rust_events else None,
+            use_rust_events=False if args.no_rust_events else (True if args.rust_events else None),
             qtable_path=args.qtable_path,
             console=args.console,
             watch_nation=args.watch,

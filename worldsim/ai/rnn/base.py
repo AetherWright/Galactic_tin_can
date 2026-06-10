@@ -21,6 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from ...core.memory import auto_batch_size
+
 # Prefer CUDA when available; otherwise fall back to CPU.
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -103,7 +105,12 @@ class RoleBaseModel:
     """
 
     _BASE_LR:    float = 1e-4
+    #: Ceiling for the replay buffer; the actual capacity is derived from the
+    #: host RAM budget at construction time (a war-role experience is ~40 KB
+    #: of nested Python lists, so 8 000 of them is ~300 MB per role model).
     _REPLAY_CAP: int   = 8_000
+    #: Ceiling for the per-step training batch; the actual size is derived
+    #: from the free VRAM (or RAM on CPU) at each update.
     _BATCH_SIZE: int   = 64
     _GAMMA:      float = 0.95
 
@@ -114,10 +121,21 @@ class RoleBaseModel:
         self._optimizer = optim.Adam(self.model.parameters(), lr=self._BASE_LR)
         # Lock serialises backward passes from concurrent nation threads.
         self._lock     = threading.Lock()
-        # Replay buffer: each entry is (cur_buf, action, reward, next_buf)
+        # Replay buffer: each entry is (cur_buf, action, reward, next_buf).
+        # Experiences are nested Python float lists: ~32 B per value plus list
+        # overhead, two BUFFER_SIZE×input_dim sequences per entry.
+        replay_item_nbytes = 2 * BUFFER_SIZE * max(1, input_dim) * 32 + 700
+        replay_cap = auto_batch_size(
+            replay_item_nbytes,
+            device="ram",
+            fraction=0.05,
+            lo=1_000,
+            hi=self._REPLAY_CAP,
+            default=self._REPLAY_CAP,
+        )
         self._replay: Deque[
             Tuple[List[List[float]], int, float, List[List[float]]]
-        ] = deque(maxlen=self._REPLAY_CAP)
+        ] = deque(maxlen=replay_cap)
         self._replay_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -136,14 +154,31 @@ class RoleBaseModel:
         """
         with self._replay_lock:
             replay_snap = list(self._replay)
-        if len(replay_snap) < self._BATCH_SIZE:
+
+        # Budget the batch against the memory the forward/backward pass will
+        # actually live in: two float32 sequences per sample plus GRU
+        # activations and gradient/optimizer headroom (~4x).
+        sample_nbytes = (
+            2 * BUFFER_SIZE * self.model.input_dim + 12 * self.model.hidden_dim
+        ) * 4 * 4
+        batch_size = auto_batch_size(
+            sample_nbytes,
+            device="vram" if _DEVICE.type == "cuda" else "ram",
+            fraction=0.10,
+            lo=16,
+            hi=256,
+            default=self._BATCH_SIZE,
+        )
+        # Keep the original warm-up point: training starts once the buffer
+        # holds a legacy-sized batch even when the budget allows bigger ones.
+        if len(replay_snap) < min(self._BATCH_SIZE, batch_size):
             return
 
         h0 = torch.zeros(1, 1, self.model.hidden_dim, device=_DEVICE)
 
         for _ in range(n_steps):
             batch = random.sample(
-                replay_snap, min(self._BATCH_SIZE, len(replay_snap))
+                replay_snap, min(batch_size, len(replay_snap))
             )
             total_loss = torch.zeros(1, device=_DEVICE)
             for cur_buf, action, reward, next_buf in batch:

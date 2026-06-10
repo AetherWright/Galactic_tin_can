@@ -7,7 +7,9 @@ Submodules
 ``flags``      runtime verbosity/approximation toggles
 ``geometry``   distance, travel time and polygon helpers
 ``growth``     logistic growth
+``memory``     RAM/VRAM probing and memory-budgeted batch sizing
 ``parallel``   shared process/thread pools
+``routing``    weighted route graphs (Rust-accelerated)
 ``timing``     wall-clock guards
 
 The package re-exports the frequently used names so call sites can simply do
@@ -36,6 +38,13 @@ from .geometry import (
     travel_time,
 )
 from .growth import logistic_growth
+from .memory import (
+    auto_batch_size,
+    available_ram_bytes,
+    available_vram_bytes,
+    budget_bytes,
+    iter_memory_batches,
+)
 from .native import USE_RUST, set_use_rust
 from .parallel import gather_batches, mp_map, pooled_map, shutdown_pool, tp_map
 from .timing import time_limit
@@ -60,6 +69,11 @@ __all__ = [
     "polygon_centroid",
     "travel_time",
     "logistic_growth",
+    "auto_batch_size",
+    "available_ram_bytes",
+    "available_vram_bytes",
+    "budget_bytes",
+    "iter_memory_batches",
     "USE_RUST",
     "set_use_rust",
     "gather_batches",

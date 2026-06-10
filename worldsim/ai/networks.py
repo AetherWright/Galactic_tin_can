@@ -1,4 +1,9 @@
-"""Sparse bidirectional layered network used by the Nelder-Mead policies."""
+"""Sparse bidirectional layered network used by the Nelder-Mead policies.
+
+Runs vectorised on the active array backend (CuPy on GPU, otherwise NumPy)
+and falls back to pure-Python lists when neither is available.  See
+:mod:`worldsim.ai._backend` for the ``WORLDSIM_AI_BACKEND`` override.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 import math
 import random
+
+from ._backend import ai_array_module
 
 
 @dataclass
@@ -43,11 +50,12 @@ class LayeredNetwork:
         self.n_inputs = n_inputs
         self.layer_sizes = [n_inputs, *layer_sizes]
         self.hidden_count = max(0, len(layer_sizes) - 1)
-        self._weights: List[List[List[float]]] = []
-        self._biases: List[List[float]] = []
-        self._forward_masks: List[List[List[float]]] = []
-        self._backward_weights: List[List[List[float]]] = []
-        self._backward_masks: List[List[List[float]]] = []
+        self._xp = ai_array_module()
+        self._weights: List[object] = []
+        self._biases: List[object] = []
+        self._forward_masks: List[object] = []
+        self._backward_weights: List[object] = []
+        self._backward_masks: List[object] = []
         rng = random.Random(seed)
         for idx, out_size in enumerate(layer_sizes):
             in_size = self.layer_sizes[idx]
@@ -63,9 +71,18 @@ class LayeredNetwork:
                 for _ in range(out_size)
             ]
             bias_vals = [rng.uniform(-spread, spread) for _ in range(out_size)]
-            self._forward_masks.append(mask)
-            self._weights.append(weight_rows)
-            self._biases.append(bias_vals)
+            if self._xp is not None:
+                xp = self._xp
+                mask_arr = xp.asarray(mask, dtype=xp.float64)
+                weights_arr = xp.asarray(weight_rows, dtype=xp.float64)
+                bias_arr = xp.asarray(bias_vals, dtype=xp.float64)
+                self._forward_masks.append(mask_arr)
+                self._weights.append(weights_arr)
+                self._biases.append(bias_arr)
+            else:
+                self._forward_masks.append(mask)
+                self._weights.append(weight_rows)
+                self._biases.append(bias_vals)
             self._apply_forward_mask(idx)
         self._init_backward_connections(rng)
 
@@ -107,7 +124,10 @@ class LayeredNetwork:
     def _build_dense_mask(self, rows: int, cols: int) -> List[List[float]]:
         return [[1.0] * cols for _ in range(rows)]
 
-    def _transpose_mask(self, mask: Sequence[Sequence[float]]) -> List[List[float]]:
+    def _transpose_mask(self, mask: object) -> object:
+        if self._xp is not None:
+            xp = self._xp
+            return xp.asarray(mask, dtype=xp.float64).T.copy()
         rows = len(mask)
         cols = len(mask[0]) if rows else 0
         return [
@@ -130,9 +150,9 @@ class LayeredNetwork:
     def _initialise_backward_matrix(
         self,
         hid_idx: int,
-        mask: Sequence[Sequence[float]],
+        mask: object,
         rng: random.Random,
-    ) -> List[List[float]]:
+    ) -> object:
         current_size = self.layer_sizes[hid_idx + 1]
         next_size = self.layer_sizes[hid_idx + 2]
         spread = 1.0 / math.sqrt(max(1, next_size))
@@ -140,19 +160,20 @@ class LayeredNetwork:
             [rng.uniform(-spread, spread) for _ in range(next_size)]
             for _ in range(current_size)
         ]
-        # Zero-out inactive connections immediately for determinism.
-        weights = [list(row) for row in base]
-        for row_idx, row_mask in enumerate(mask):
-            for col_idx, active in enumerate(row_mask):
-                if not active:
-                    weights[row_idx][col_idx] = 0.0
-        return weights
+        if self._xp is not None:
+            xp = self._xp
+            return xp.asarray(base, dtype=xp.float64)
+        return base
 
     def _apply_forward_mask(self, layer_idx: int) -> None:
         if layer_idx >= len(self._forward_masks):
             return
         mask = self._forward_masks[layer_idx]
         weights = self._weights[layer_idx]
+        if self._xp is not None:
+            xp = self._xp
+            xp.multiply(weights, mask, out=weights)
+            return
         for row_idx, row_mask in enumerate(mask):
             for col_idx, active in enumerate(row_mask):
                 if not active:
@@ -163,6 +184,10 @@ class LayeredNetwork:
             return
         mask = self._backward_masks[pair_idx]
         weights = self._backward_weights[pair_idx]
+        if self._xp is not None:
+            xp = self._xp
+            xp.multiply(weights, mask, out=weights)
+            return
         for row_idx, row_mask in enumerate(mask):
             for col_idx, active in enumerate(row_mask):
                 if not active:
@@ -172,29 +197,82 @@ class LayeredNetwork:
         vec = list(inputs)[: self.n_inputs]
         if len(vec) < self.n_inputs:
             vec.extend([0.0] * (self.n_inputs - len(vec)))
+        if self._xp is not None:
+            xp = self._xp
+            return xp.asarray(vec, dtype=xp.float64)
         return vec
 
-    def _to_list(self, values: Sequence[float]) -> List[float]:
-        return [float(value) for value in values]
+    def _to_list(self, values: object) -> List[float]:
+        if self._xp is not None:
+            xp = self._xp
+            arr = values
+            if not hasattr(arr, "tolist"):
+                arr = xp.asarray(list(values), dtype=xp.float64)
+            data = arr.tolist()
+            if isinstance(data, list):
+                return [float(val) for val in data]
+            return [float(data)]
+        return [float(val) for val in values]
 
     def _compute_layers(
         self,
-        inputs: Sequence[float],
+        inputs: object,
         scales: Sequence[float],
         *,
         return_trace: bool,
-        future_hidden: Optional[Sequence[Sequence[float]]] = None,
+        future_hidden: Optional[Sequence[object]] = None,
     ) -> _ForwardState:
+        if self._xp is not None:
+            xp = self._xp
+            outputs = inputs
+            total_neurons = sum(layer.shape[0] for layer in self._weights)
+            if total_neurons:
+                scales_array = xp.ones(total_neurons, dtype=xp.float64)
+                if scales:
+                    provided = xp.asarray(list(scales), dtype=xp.float64)
+                    limit = min(int(provided.size), total_neurons)
+                    if limit:
+                        scales_array[:limit] = provided[:limit]
+            else:
+                scales_array = xp.zeros(0, dtype=xp.float64)
+            scale_idx = 0
+            trace: List[Tuple[List[float], List[float]]] = []
+            hidden_outputs: List[object] = []
+            for layer_idx, (weights, bias) in enumerate(zip(self._weights, self._biases)):
+                layer_inputs = outputs
+                linear = weights.dot(outputs) + bias
+                if (
+                    future_hidden is not None
+                    and layer_idx < self.hidden_count - 1
+                    and layer_idx < len(self._backward_weights)
+                ):
+                    next_hidden = future_hidden[layer_idx + 1]
+                    if not hasattr(next_hidden, "dtype"):
+                        next_hidden = xp.asarray(list(next_hidden), dtype=xp.float64)
+                    backward = self._backward_weights[layer_idx].dot(next_hidden)
+                    linear = linear + backward
+                if linear.size:
+                    layer_scale = scales_array[scale_idx : scale_idx + linear.size]
+                    if layer_scale.size < linear.size:
+                        pad = xp.ones(linear.size - layer_scale.size, dtype=xp.float64)
+                        layer_scale = xp.concatenate([layer_scale, pad])
+                    linear = linear * layer_scale
+                scale_idx += linear.size
+                is_output = layer_idx == len(self._weights) - 1
+                outputs = linear if is_output else xp.tanh(linear)
+                if layer_idx < self.hidden_count:
+                    hidden_outputs.append(outputs.copy())
+                if return_trace:
+                    trace.append((self._to_list(layer_inputs), self._to_list(outputs)))
+            return _ForwardState(outputs, trace, hidden_outputs)
+
         outputs = list(inputs)
         scale_values = list(scales)
         total_neurons = sum(len(layer) for layer in self._weights)
         if len(scale_values) < total_neurons:
-            scale_values = [
-                *scale_values,
-                *([1.0] * (total_neurons - len(scale_values)))
-            ]
-        trace: List[Tuple[List[float], List[float]]] = []
-        hidden_outputs: List[List[float]] = []
+            scale_values = [*scale_values, *([1.0] * (total_neurons - len(scale_values)))]
+        trace = []
+        hidden_outputs = []
         scale_idx = 0
         for layer_idx, (weights, bias) in enumerate(zip(self._weights, self._biases)):
             layer_inputs = list(outputs)
@@ -264,6 +342,53 @@ class LayeredNetwork:
         if lr <= 0.0:
             return
         limit = max(1.0, weight_clip)
+        if self._xp is not None:
+            xp = self._xp
+            for layer_idx, (inputs, outputs) in enumerate(trace):
+                if layer_idx >= len(self._weights):
+                    break
+                weights = self._weights[layer_idx]
+                biases = self._biases[layer_idx]
+                inp = xp.asarray(list(inputs), dtype=xp.float64)
+                out = xp.asarray(list(outputs), dtype=xp.float64)
+                if inp.size < weights.shape[1]:
+                    pad = xp.zeros(weights.shape[1] - int(inp.size), dtype=xp.float64)
+                    inp = xp.concatenate([inp, pad])
+                if inp.size > weights.shape[1]:
+                    inp = inp[: weights.shape[1]]
+                if out.size < weights.shape[0]:
+                    pad = xp.zeros(weights.shape[0] - int(out.size), dtype=xp.float64)
+                    out = xp.concatenate([out, pad])
+                if out.size > weights.shape[0]:
+                    out = out[: weights.shape[0]]
+                weights += lr * xp.outer(out, inp)
+                self._apply_forward_mask(layer_idx)
+                biases += lr * out
+                xp.clip(weights, -limit, limit, out=weights)
+                xp.clip(biases, -limit, limit, out=biases)
+                if (
+                    layer_idx < len(self._backward_weights)
+                    and layer_idx < self.hidden_count - 1
+                    and layer_idx + 1 < len(trace)
+                ):
+                    next_outputs = xp.asarray(
+                        list(trace[layer_idx + 1][1]), dtype=xp.float64
+                    )
+                    back_weights = self._backward_weights[layer_idx]
+                    if next_outputs.size < back_weights.shape[1]:
+                        pad = xp.zeros(
+                            back_weights.shape[1] - int(next_outputs.size),
+                            dtype=xp.float64,
+                        )
+                        next_outputs = xp.concatenate([next_outputs, pad])
+                    if next_outputs.size > back_weights.shape[1]:
+                        next_outputs = next_outputs[: back_weights.shape[1]]
+                    current = out[: back_weights.shape[0]]
+                    back_weights += lr * xp.outer(current, next_outputs)
+                    self._apply_backward_mask(layer_idx)
+                    xp.clip(back_weights, -limit, limit, out=back_weights)
+            return
+
         for layer_idx, (inputs, outputs) in enumerate(trace):
             if layer_idx >= len(self._weights):
                 break
@@ -329,42 +454,66 @@ class LayeredNetwork:
         biases = payload.get("biases")
         if not isinstance(weights, list) or not isinstance(biases, list):
             raise ValueError("invalid network weights")
-        obj._weights = [
+        xp = ai_array_module()
+        parsed_weights = [
             [[float(value) for value in row] for row in layer]
             for layer in weights
         ]
-        obj._biases = [[float(value) for value in vec] for vec in biases]
+        parsed_biases = [[float(value) for value in vec] for vec in biases]
+        obj._xp = xp
+        if xp is not None:
+            obj._weights = [xp.asarray(layer, dtype=xp.float64) for layer in parsed_weights]
+            obj._biases = [xp.asarray(vec, dtype=xp.float64) for vec in parsed_biases]
+        else:
+            obj._weights = parsed_weights
+            obj._biases = parsed_biases
         forward_masks = payload.get("forward_masks")
         if isinstance(forward_masks, list):
-            obj._forward_masks = [
+            parsed_masks = [
                 [[float(value) for value in row] for row in layer]
                 for layer in forward_masks
             ]
         else:
             rng = random.Random()
-            obj._forward_masks = []
-            total_layers = len(obj._weights)
-            for idx, layer in enumerate(obj._weights):
+            parsed_masks = []
+            total_layers = len(parsed_weights)
+            for idx, layer in enumerate(parsed_weights):
                 rows = len(layer)
                 cols = len(layer[0]) if layer else 0
                 sparse = 0 < idx < total_layers - 1
-                obj._forward_masks.append(
-                    obj._build_mask(rows, cols, rng, sparse=sparse)
-                )
+                parsed_masks.append(obj._build_mask(rows, cols, rng, sparse=sparse))
+        if xp is not None:
+            obj._forward_masks = [xp.asarray(layer, dtype=xp.float64) for layer in parsed_masks]
+        else:
+            obj._forward_masks = parsed_masks
         for idx in range(len(obj._weights)):
             obj._apply_forward_mask(idx)
         backward_weights = payload.get("backward_weights")
         backward_masks = payload.get("backward_masks")
+        obj._backward_weights = []
+        obj._backward_masks = []
         if isinstance(backward_weights, list):
-            obj._backward_weights = [
+            parsed_back_weights = [
                 [[float(value) for value in row] for row in layer]
                 for layer in backward_weights
             ]
+            if xp is not None:
+                obj._backward_weights = [
+                    xp.asarray(layer, dtype=xp.float64) for layer in parsed_back_weights
+                ]
+            else:
+                obj._backward_weights = parsed_back_weights
             if isinstance(backward_masks, list):
-                obj._backward_masks = [
+                parsed_back_masks = [
                     [[float(value) for value in row] for row in layer]
                     for layer in backward_masks
                 ]
+                if xp is not None:
+                    obj._backward_masks = [
+                        xp.asarray(layer, dtype=xp.float64) for layer in parsed_back_masks
+                    ]
+                else:
+                    obj._backward_masks = parsed_back_masks
             else:
                 obj._backward_masks = []
                 for hid_idx in range(max(0, obj.hidden_count - 1)):
@@ -380,6 +529,11 @@ class LayeredNetwork:
     # Properties -------------------------------------------------------
     @property
     def weights(self) -> List[List[List[float]]]:
+        if self._xp is not None:
+            return [
+                [[float(value) for value in row] for row in layer.tolist()]
+                for layer in self._weights
+            ]
         return [
             [list(row) for row in layer]
             for layer in self._weights
@@ -387,21 +541,36 @@ class LayeredNetwork:
 
     @weights.setter
     def weights(self, value: Sequence[Sequence[Sequence[float]]]) -> None:
-        self._weights = [[list(row) for row in layer] for layer in value]
+        if self._xp is not None:
+            xp = self._xp
+            self._weights = [xp.asarray(layer, dtype=xp.float64) for layer in value]
+        else:
+            self._weights = [[list(row) for row in layer] for layer in value]
         for idx in range(len(self._weights)):
             if idx < len(self._forward_masks):
                 self._apply_forward_mask(idx)
 
     @property
     def biases(self) -> List[List[float]]:
+        if self._xp is not None:
+            return [[float(v) for v in layer.tolist()] for layer in self._biases]
         return [list(layer) for layer in self._biases]
 
     @biases.setter
     def biases(self, value: Sequence[Sequence[float]]) -> None:
-        self._biases = [list(layer) for layer in value]
+        if self._xp is not None:
+            xp = self._xp
+            self._biases = [xp.asarray(layer, dtype=xp.float64) for layer in value]
+        else:
+            self._biases = [list(layer) for layer in value]
 
     @property
     def forward_masks(self) -> List[List[List[float]]]:
+        if self._xp is not None:
+            return [
+                [[float(value) for value in row] for row in mask.tolist()]
+                for mask in self._forward_masks
+            ]
         return [
             [list(row) for row in mask]
             for mask in self._forward_masks
@@ -409,12 +578,21 @@ class LayeredNetwork:
 
     @forward_masks.setter
     def forward_masks(self, value: Sequence[Sequence[Sequence[float]]]) -> None:
-        self._forward_masks = [[list(row) for row in layer] for layer in value]
+        if self._xp is not None:
+            xp = self._xp
+            self._forward_masks = [xp.asarray(layer, dtype=xp.float64) for layer in value]
+        else:
+            self._forward_masks = [[list(row) for row in layer] for layer in value]
         for idx in range(len(self._weights)):
             self._apply_forward_mask(idx)
 
     @property
     def backward_weights(self) -> List[List[List[float]]]:
+        if self._xp is not None:
+            return [
+                [[float(value) for value in row] for row in layer.tolist()]
+                for layer in self._backward_weights
+            ]
         return [
             [list(row) for row in layer]
             for layer in self._backward_weights
@@ -422,15 +600,23 @@ class LayeredNetwork:
 
     @backward_weights.setter
     def backward_weights(self, value: Sequence[Sequence[Sequence[float]]]) -> None:
-        self._backward_weights = [
-            [list(row) for row in layer]
-            for layer in value
-        ]
+        if self._xp is not None:
+            xp = self._xp
+            self._backward_weights = [
+                xp.asarray(layer, dtype=xp.float64) for layer in value
+            ]
+        else:
+            self._backward_weights = [[list(row) for row in layer] for layer in value]
         for idx in range(len(self._backward_weights)):
             self._apply_backward_mask(idx)
 
     @property
     def backward_masks(self) -> List[List[List[float]]]:
+        if self._xp is not None:
+            return [
+                [[float(value) for value in row] for row in mask.tolist()]
+                for mask in self._backward_masks
+            ]
         return [
             [list(row) for row in mask]
             for mask in self._backward_masks
@@ -438,10 +624,12 @@ class LayeredNetwork:
 
     @backward_masks.setter
     def backward_masks(self, value: Sequence[Sequence[Sequence[float]]]) -> None:
-        self._backward_masks = [
-            [list(row) for row in layer]
-            for layer in value
-        ]
+        if self._xp is not None:
+            xp = self._xp
+            self._backward_masks = [
+                xp.asarray(layer, dtype=xp.float64) for layer in value
+            ]
+        else:
+            self._backward_masks = [[list(row) for row in layer] for layer in value]
         for idx in range(len(self._backward_weights)):
             self._apply_backward_mask(idx)
-

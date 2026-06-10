@@ -6,6 +6,7 @@ from typing import Optional, Tuple, List, Dict
 from ...core.backend import _np
 from ...society.ideas import Idea
 from ..registry import PLANETS
+from ...core.memory import iter_memory_batches
 
 __all__ = ['City', 'process_city_batch', 'process_rural_migration']
 
@@ -156,7 +157,47 @@ class City:
             self.infrastructure += float(level)
 
 
+#: Rough per-city working-set during the vectorised update: ~20 float64
+#: columns plus temporaries.
+_CITY_ITEM_NBYTES: int = 2_048
+
+
 def process_city_batch(
+    cities: List[City],
+    plague_level: float,
+    radiation_level: float,
+    plague_resist: float,
+    tech_bonus: float,
+    growth_mult: float = 1.0,
+    cap_mult: float = 1.0,
+    stability: float = 75.0,
+    hospital_count: int = 0,
+    econ_health: float = 0.5,
+) -> Tuple[int, float]:
+    """Memory-budgeted driver around :func:`_process_city_chunk`.
+
+    Splits very large city lists into chunks sized from the available RAM so
+    the vectorised update never allocates beyond its budget; results are
+    summed across chunks.
+    """
+    total_pop = 0
+    total_econ = 0.0
+    for chunk in iter_memory_batches(
+        cities, _CITY_ITEM_NBYTES, fraction=0.10, lo=512
+    ):
+        pop, econ = _process_city_chunk(
+            chunk, plague_level, radiation_level, plague_resist, tech_bonus,
+            growth_mult, cap_mult,
+            stability=stability,
+            hospital_count=hospital_count,
+            econ_health=econ_health,
+        )
+        total_pop += pop
+        total_econ += econ
+    return total_pop, total_econ
+
+
+def _process_city_chunk(
     cities: List[City],
     plague_level: float,
     radiation_level: float,

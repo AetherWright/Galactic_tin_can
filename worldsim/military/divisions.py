@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 from ..ai import SimplePerceptron
+from ..ai.native import make_perceptron
 from ..planets import PLANETS
 from .logistics import _supply_throughput
 
@@ -57,10 +58,10 @@ class Division:
     template: str = "Infantry"
     doctrine: str = "Balanced"
     controller: SimplePerceptron = field(
-        default_factory=lambda: SimplePerceptron(3, n_outputs=3)
+        default_factory=lambda: make_perceptron(3, n_outputs=3)
     )
     movement_controller: SimplePerceptron = field(
-        default_factory=lambda: SimplePerceptron(6, n_outputs=3)
+        default_factory=lambda: make_perceptron(6, n_outputs=3)
     )
     posture: str = "reserve"
     order: str = "reserve"

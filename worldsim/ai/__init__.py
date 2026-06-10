@@ -2,15 +2,15 @@
 
 Submodules
 ----------
-``perceptron``       SimplePerceptron (CPU)
-``networks``         LayeredNetwork — sparse bidirectional layered net
+``perceptron``       SimplePerceptron (vectorised on NumPy/CuPy)
+``networks``         LayeredNetwork — sparse bidirectional layered net (NumPy/CuPy)
 ``nelder_mead``      plain simplex minimiser
 ``policy``           NelderMeadPolicy base class
 ``roles``            per-role Nelder-Mead facades (WarAI, DiplomacyAI, …)
 ``strategic``        StrategicNelderMeadAI continuous planner
 ``rnn``              PyTorch GRU base models + per-nation LoRA adapters
 ``torch_fleet``      PyTorch MLP fleet controller
-``gpu``              CuPy-accelerated twin of the Nelder-Mead stack
+``native``           Rust/C++ perceptron banks for division controllers
 ``neat``/``graph``   NEAT-inspired topology evolution
 ``meta_ga``          reward-weight genetic algorithm
 ``embeddings``       action embedding helpers
@@ -51,10 +51,12 @@ def set_use_neat(flag: bool) -> None:
 
 
 def set_use_rust(flag: bool) -> None:
-    """Retain the old API for toggling Rust helpers."""
+    """Toggle the native (Rust/C++) perceptron backend for division controllers."""
 
     global _USE_RUST
     _USE_RUST = bool(flag)
+    from . import native as _native
+    _native.set_enabled(_USE_RUST)
 
 
 __all__ = [

@@ -18,6 +18,7 @@ Design notes
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -30,6 +31,7 @@ except ImportError:               # pragma: no cover
 from ..planets import PLANETS
 from .generator import ProceduralEventGenerator
 from .qlearner import EventQLearner
+from .rust_bridge import RustEventBridge
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..nations import Nation
@@ -43,6 +45,7 @@ class EventDecisionEngine:
         events: Dict[str, List[Dict]],
         *,
         qtable_path: str | None = None,
+        use_rust: bool | None = None,
         **_: object,
     ) -> None:
         self.events = events
@@ -51,6 +54,14 @@ class EventDecisionEngine:
         self.q_learner  = EventQLearner()
         if self.qtable_path:
             self.load_qtables()
+        # Optional rust_events crate backend.  Opt-in: it round-trips its own
+        # YAML table through a subprocess per event, so ``None`` only enables
+        # it when WORLDSIM_USE_RUST_EVENTS requests it explicitly.
+        self.rust_bridge: RustEventBridge | None = None
+        if use_rust is None:
+            use_rust = os.getenv("WORLDSIM_USE_RUST_EVENTS", "0").lower() in {"1", "true", "yes"}
+        if use_rust and self.qtable_path:
+            self.rust_bridge = RustEventBridge.create(self.qtable_path)
 
     # ------------------------------------------------------------------
     # Q-table persistence
@@ -162,6 +173,12 @@ class EventDecisionEngine:
         """
         if not options:
             return 0
+        if self.rust_bridge is not None and self.rust_bridge.alive:
+            rust_choice = self.rust_bridge.choose(
+                event, len(options), self._state_snapshot(nation)
+            )
+            if rust_choice is not None:
+                return rust_choice
         q_choice = self.q_learner.choose(nation, event, len(options))
         if q_choice is not None:
             return q_choice
@@ -252,6 +269,10 @@ class EventDecisionEngine:
 
         # Always update the Q-learner so it learns from every event.
         self.q_learner.update(nation, event, idx, reward, len(options))
+        # Mirror the transition into the rust_events table when the bridge is
+        # active, so both backends learn from the same history.
+        if self.rust_bridge is not None and self.rust_bridge.alive:
+            self.rust_bridge.update(event, before, idx, reward, after)
 
         if collect:
             return {

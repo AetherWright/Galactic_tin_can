@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, TYPE_CHECKING
 
+from ..core.memory import iter_memory_batches
 from ..core.parallel import pooled_map
 from ..galaxy.star import STARS
 from ..planets import PLANETS
@@ -88,8 +89,13 @@ def update_star_ownership(nations: Dict[int, "Nation"]) -> None:
             planets_data.append(cities)
         info.append((star.name, planets_data, economies, militaries))
 
-    results = pooled_map(star_owner_worker, info, mode="process", chunksize=0)
-    for name, owner in results:
-        star = STARS.get(name)
-        if star is not None:
-            star.owner = owner
+    # Every task pickles the per-star city data plus both nation dicts, so
+    # the submission footprint grows with stars × nations.  Chunk it against
+    # the RAM budget; a single chunk covers the common case.
+    item_nbytes = 256 + 128 * max(1, len(nations))
+    for batch in iter_memory_batches(info, item_nbytes, fraction=0.05, lo=8):
+        results = pooled_map(star_owner_worker, batch, mode="process", chunksize=0)
+        for name, owner in results:
+            star = STARS.get(name)
+            if star is not None:
+                star.owner = owner

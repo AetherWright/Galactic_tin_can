@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
 from ...core.backend import _np
+from ...core.memory import iter_memory_batches
 
 __all__ = ["Colony", "process_colony_batch"]
 
@@ -68,7 +69,31 @@ class Colony:
 from ..registry import PLANETS
 
 
+#: Rough per-colony working-set during the vectorised update.
+_COLONY_ITEM_NBYTES: int = 1_024
+
+
 def process_colony_batch(
+    colonies: List[Colony],
+    plague_level: float,
+    plague_resist: float,
+    stability: float = 75.0,
+    radiation_level: float = 0.0,
+) -> int:
+    """Memory-budgeted driver around :func:`_process_colony_chunk`."""
+    total = 0
+    for chunk in iter_memory_batches(
+        colonies, _COLONY_ITEM_NBYTES, fraction=0.10, lo=1_024
+    ):
+        total += _process_colony_chunk(
+            chunk, plague_level, plague_resist,
+            stability=stability,
+            radiation_level=radiation_level,
+        )
+    return total
+
+
+def _process_colony_chunk(
     colonies: List[Colony],
     plague_level: float,
     plague_resist: float,
