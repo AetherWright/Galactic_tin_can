@@ -486,6 +486,73 @@ class TestPersistence:
 
 
 # ---------------------------------------------------------------------------
+# 7b. Hierarchical civilian seed merging (NelderMead sub-models)
+# ---------------------------------------------------------------------------
+
+class TestCivilianSeedMerge:
+    """The cross-run seed merger must reach the CivilianController's overseer
+    and per-department sub-models, not skip the wrapper.  Built directly from
+    NelderMead policies so the test is backend-independent.
+    """
+
+    @staticmethod
+    def _make_ctrl():
+        from worldsim.ai.roles import CivilianOverseerAI, DepartmentPolicyAI
+        return CivilianController(
+            overseer=CivilianOverseerAI(
+                n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22,
+            ),
+            dept_models={
+                d.slug: DepartmentPolicyAI(d.slug, d.n_actions, n_inputs=22)
+                for d in DEPARTMENTS
+            },
+        )
+
+    def test_subgroups_cover_overseer_and_departments(self):
+        from types import SimpleNamespace
+        from worldsim.ai.persistence import _civilian_subgroups
+        ctrls = [self._make_ctrl(), self._make_ctrl()]
+        nations = {i: SimpleNamespace(civilian_ai=c) for i, c in enumerate(ctrls)}
+        groups = _civilian_subgroups(nations)
+        assert set(groups) == {"overseer"} | {d.slug for d in DEPARTMENTS}
+        # Every nation contributes one sub-model to each group.
+        assert all(len(v) == len(ctrls) for v in groups.values())
+
+    def test_merge_and_reload_round_trip(self, tmp_path):
+        from types import SimpleNamespace
+        from worldsim.ai.persistence import (
+            _civilian_subgroups, _build_merged_payload, _apply_seed_payload,
+        )
+        import yaml
+
+        ctrls = [self._make_ctrl(), self._make_ctrl()]
+        # Diverge the overseers so the merged weights are non-trivial.
+        state = [0.3] * 22
+        ctrls[0].overseer.train(state, 0, 1.0, state)
+        ctrls[1].overseer.train(state, 1, 1.0, state)
+
+        nations = {i: SimpleNamespace(civilian_ai=c) for i, c in enumerate(ctrls)}
+        groups = _civilian_subgroups(nations)
+
+        # Persist each sub-model seed.
+        for name, policies in groups.items():
+            payload = _build_merged_payload(policies)
+            assert payload is not None, f"no merged payload for {name}"
+            with open(tmp_path / f"seed_civilian_{name}.yml", "w") as fh:
+                yaml.safe_dump(payload, fh)
+
+        # A fresh controller reloads the overseer seed and changes weights.
+        fresh = self._make_ctrl()
+        before = fresh.overseer.network.to_dict()
+        with open(tmp_path / "seed_civilian_overseer.yml") as fh:
+            payload = yaml.safe_load(fh)
+        _apply_seed_payload(fresh.overseer, payload)
+        assert fresh.overseer.network.to_dict() != before, (
+            "overseer weights not updated from merged civilian seed"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 8. save.py backwards compatibility: NelderMeadPolicy worlds still work
 # ---------------------------------------------------------------------------
 

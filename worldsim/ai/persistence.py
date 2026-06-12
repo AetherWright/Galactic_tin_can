@@ -189,6 +189,71 @@ def _build_merged_payload(policies: list) -> Optional[Dict]:
     }
 
 
+def _civilian_subgroups(nations: Dict[int, Nation]) -> Dict[str, list]:
+    """Group civilian sub-models by their position in the hierarchy.
+
+    Returns a mapping ``name -> [policy, ...]`` where *name* is ``"overseer"``
+    or a department slug, gathering the matching sub-model from every nation
+    whose ``civilian_ai`` is a :class:`CivilianController`.  Used so the seed
+    merger can average each sub-model across nations independently.  Non-torch
+    (NelderMead) and torch sub-models are returned alike; the actual merge in
+    :func:`_build_merged_payload` keeps only the NelderMead-shaped ones (torch
+    controllers are seeded via the shared ``torch_bases`` checkpoints instead).
+    """
+    from ..nations.civilian import CivilianController
+
+    groups: Dict[str, list] = {}
+    for n in nations.values():
+        ctrl = getattr(n, "civilian_ai", None)
+        if not isinstance(ctrl, CivilianController):
+            continue
+        groups.setdefault("overseer", []).append(ctrl.overseer)
+        for slug, model in ctrl.dept_models.items():
+            groups.setdefault(slug, []).append(model)
+    return groups
+
+
+def _load_civilian_seeds(nations: Dict[int, Nation], seed_dir: Path) -> bool:
+    """Inject merged civilian sub-model seeds back into each nation.
+
+    Mirrors :func:`_civilian_subgroups`: looks for ``seed_civilian_{name}.yml``
+    files and applies each to the corresponding overseer / department model.
+    Returns ``True`` if at least one seed file was applied.
+    """
+    from ..nations.civilian import CivilianController
+
+    loaded = False
+    cache: Dict[str, Optional[Dict]] = {}
+
+    def _payload_for(name: str) -> Optional[Dict]:
+        if name not in cache:
+            path = seed_dir / f"seed_civilian_{name}.yml"
+            if not path.exists():
+                cache[name] = None
+            else:
+                try:
+                    with open(path, encoding="utf8") as fh:
+                        cache[name] = _yaml.safe_load(fh) or {}
+                except OSError:
+                    cache[name] = None
+        return cache[name]
+
+    for nation in nations.values():
+        ctrl = getattr(nation, "civilian_ai", None)
+        if not isinstance(ctrl, CivilianController):
+            continue
+        for name, model in (("overseer", ctrl.overseer), *ctrl.dept_models.items()):
+            payload = _payload_for(name)
+            if not payload:
+                continue
+            try:
+                _apply_seed_payload(model, payload)
+                loaded = True
+            except Exception:    # architecture mismatch / torch sub-model
+                pass
+    return loaded
+
+
 def _apply_seed_payload(policy, payload: Dict) -> None:
     """Load averaged seed weights into an existing NelderMeadPolicy.
 
@@ -348,6 +413,17 @@ def merge_and_save_models(
 
     # --- per-role NelderMeadPolicy seeds ---
     for role, attr in _ROLE_TO_ATTR.items():
+        # The civilian AI is a hierarchical CivilianController, not a flat
+        # policy — merge its overseer + per-department sub-models separately.
+        if role == "civilian":
+            for name, policies in _civilian_subgroups(nations).items():
+                payload = _build_merged_payload(policies)
+                if payload is None:
+                    continue
+                with open(seed_dir / f"seed_civilian_{name}.yml", "w",
+                          encoding="utf8") as fh:
+                    _yaml.safe_dump(payload, fh, default_flow_style=False)
+            continue
         policies = [
             getattr(n, attr)
             for n in nations.values()
@@ -408,6 +484,10 @@ def load_model_seeds(
 
     # --- NelderMeadPolicy roles ---
     for role, attr in _ROLE_TO_ATTR.items():
+        if role == "civilian":
+            if _load_civilian_seeds(nations, seed_dir):
+                loaded = True
+            continue
         path = seed_dir / f"seed_{role}.yml"
         if not path.exists():
             continue
