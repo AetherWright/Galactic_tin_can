@@ -117,6 +117,27 @@ from .civilian import (
 )
 
 
+def _iter_rnn_controllers(ctrl: Any):
+    """Yield every underlying torch RNN controller for *ctrl*.
+
+    A :class:`CivilianController` is hierarchical: it owns an overseer plus
+    one model per department.  Expanding it here lets meta-evolution reach
+    each per-nation LoRA, rather than skipping the wrapper entirely.  Any
+    non-torch (NelderMead) or ``None`` controller yields nothing.
+    """
+    try:
+        from ..ai.rnn import RNNController
+    except Exception:
+        return
+    if isinstance(ctrl, CivilianController):
+        candidates = (ctrl.overseer, *ctrl.dept_models.values())
+    else:
+        candidates = (ctrl,)
+    for c in candidates:
+        if isinstance(c, RNNController):
+            yield c
+
+
 
 @dataclass(slots=True)
 class Nation:
@@ -442,16 +463,18 @@ class Nation:
         # weighting.  Silent failure when torch is absent or controllers
         # are the legacy NelderMead type.
         try:
-            from ..ai.rnn import RNNController
             _CTRL_ATTRS = (
                 "civilian_ai", "military_ai", "project_ai",
                 "diplomacy_ai", "research_ai", "doctrine_ai",
             )
             for attr in _CTRL_ATTRS:
                 ctrl = getattr(self, attr, None)
-                if isinstance(ctrl, RNNController):
-                    ctrl.mutate_lora(sigma=0.02)
-                    ctrl.reset_lora_optimizer()
+                # The civilian AI is a hierarchical CivilianController wrapping
+                # an overseer plus one model per department; expand it so each
+                # underlying RNN controller is evolved.
+                for sub in _iter_rnn_controllers(ctrl):
+                    sub.mutate_lora(sigma=0.02)
+                    sub.reset_lora_optimizer()
         except Exception:
             pass
 

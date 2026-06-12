@@ -30,6 +30,8 @@ import torch
 from worldsim.ai.rnn import (
     TorchWarAI,
     TorchDomesticPolicyAI,
+    TorchCivilianOverseer,
+    TorchDepartmentAI,
     TorchProjectAI,
     TorchDiplomacyAI,
     TorchResearchAI,
@@ -42,6 +44,12 @@ from worldsim.ai.rnn import (
     rnn_available,
     _REGISTRY,
     _REGISTRY_LOCK,
+)
+from worldsim.nations.civilian import (
+    CivilianController,
+    DEPARTMENTS,
+    N_CIVILIAN_ACTIONS,
+    N_CIVILIAN_DEPARTMENTS,
 )
 
 
@@ -58,6 +66,18 @@ def make_world() -> Dict:
     """Create a fresh minimal world.  Each call clears global planet/star state."""
     from worldsim.galaxy import init_world
     return init_world(NUM_NATIONS, NUM_STARS, starting_population=START_POP)
+
+
+def civ_overseer(nation):
+    """Return a representative civilian RNN sub-controller for internals checks.
+
+    ``civilian_ai`` is now a hierarchical :class:`CivilianController` that
+    wraps an overseer plus one model per department.  The overseer is itself
+    an ordinary RNN controller, so it exposes the per-nation LoRA tensors,
+    shared ``base`` model, rolling ``_buffer`` and ``_h`` hidden state that
+    these end-to-end tests probe.
+    """
+    return nation.civilian_ai.overseer
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +98,13 @@ class TestControllerTypes:
     def test_civilian_ai_is_torch(self):
         nations = make_world()
         for n in nations.values():
-            assert isinstance(n.civilian_ai, TorchDomesticPolicyAI)
+            # Civilian AI is a hierarchical controller: a torch overseer that
+            # routes to one torch model per department.
+            assert isinstance(n.civilian_ai, CivilianController)
+            assert isinstance(n.civilian_ai.overseer, TorchCivilianOverseer)
+            assert n.civilian_ai.dept_models, "no department sub-models created"
+            for model in n.civilian_ai.dept_models.values():
+                assert isinstance(model, TorchDepartmentAI)
 
     def test_project_ai_is_torch(self):
         nations = make_world()
@@ -106,7 +132,15 @@ class TestControllerTypes:
         nations = make_world()
         for n in nations.values():
             assert n.military_ai.n_outputs  == 2
-            assert n.civilian_ai.n_outputs  == 21
+            # The overseer chooses among departments; each department model
+            # chooses among its own local actions.  The leaf actions across
+            # all departments still total N_CIVILIAN_ACTIONS.
+            assert n.civilian_ai.overseer.n_outputs == N_CIVILIAN_DEPARTMENTS
+            assert sum(
+                m.n_outputs for m in n.civilian_ai.dept_models.values()
+            ) == N_CIVILIAN_ACTIONS
+            for dept in DEPARTMENTS:
+                assert n.civilian_ai.dept_models[dept.slug].n_outputs == dept.n_actions
             assert n.project_ai.n_outputs   == len(PROJECT_CATALOG)
             assert n.diplomacy_ai.n_outputs == 3
             # research_ai.n_outputs == number of tech nodes at creation time
@@ -122,8 +156,8 @@ class TestBaseModelRegistry:
     def test_nations_share_civilian_base(self):
         nations = make_world()
         ns = list(nations.values())
-        assert ns[0].civilian_ai.base is ns[1].civilian_ai.base
-        assert ns[1].civilian_ai.base is ns[2].civilian_ai.base
+        assert civ_overseer(ns[0]).base is civ_overseer(ns[1]).base
+        assert civ_overseer(ns[1]).base is civ_overseer(ns[2]).base
 
     def test_nations_share_war_base(self):
         nations = make_world()
@@ -140,7 +174,7 @@ class TestBaseModelRegistry:
         nations = make_world()
         ns = list(nations.values())
         # Different Python objects even though they share the base
-        assert ns[0].civilian_ai.lora_B_out is not ns[1].civilian_ai.lora_B_out
+        assert civ_overseer(ns[0]).lora_B_out is not civ_overseer(ns[1]).lora_B_out
 
     def test_registry_has_role_entries_after_init(self):
         """At least the civilian and war keys should appear in the registry."""
@@ -166,10 +200,10 @@ class TestProcessTurn:
         nations = make_world()
         ns = list(nations.values())
         # Record baseline (may be non-zero from earlier tests in session)
-        baseline = len(ns[0].civilian_ai.base._replay)
+        baseline = len(civ_overseer(ns[0]).base._replay)
         ns[0].process_turn(nations)
-        # At least one experience added (civilian AI calls train every turn)
-        assert len(ns[0].civilian_ai.base._replay) > baseline
+        # At least one experience added (the overseer trains every turn)
+        assert len(civ_overseer(ns[0]).base._replay) > baseline
 
     def test_doctrine_replay_grows_after_turn(self):
         nations = make_world()
@@ -182,9 +216,9 @@ class TestProcessTurn:
         """The GRU hidden state should advance from zero after a real turn."""
         nations = make_world()
         n = list(nations.values())[0]
-        h_before_norm = n.civilian_ai._h.norm().item()
+        h_before_norm = civ_overseer(n)._h.norm().item()
         n.process_turn(nations)
-        h_after_norm  = n.civilian_ai._h.norm().item()
+        h_after_norm  = civ_overseer(n)._h.norm().item()
         # Hidden state must change (it may or may not be exactly zero before,
         # depending on prior test state — just verify it is finite)
         assert math.isfinite(h_after_norm)
@@ -194,10 +228,10 @@ class TestProcessTurn:
         """The civilian LoRA B matrix must change during a turn (TD(0) update)."""
         nations = make_world()
         n = list(nations.values())[0]
-        b_before = n.civilian_ai.lora_B_out.data.clone()
+        b_before = civ_overseer(n).lora_B_out.data.clone()
         n.process_turn(nations)
         n.process_turn(nations)   # second turn ensures gradient is non-trivial
-        b_after = n.civilian_ai.lora_B_out.data.clone()
+        b_after = civ_overseer(n).lora_B_out.data.clone()
         assert not torch.allclose(b_before, b_after), (
             "civilian LoRA B_out did not change after two simulation turns"
         )
@@ -209,7 +243,7 @@ class TestProcessTurn:
         for _ in range(5):
             n.process_turn(nations)
         for attr in ("lora_A_in", "lora_B_in", "lora_A_out", "lora_B_out"):
-            t = getattr(n.civilian_ai, attr)
+            t = getattr(civ_overseer(n), attr)
             assert torch.all(torch.isfinite(t)), f"{attr} contains NaN/Inf"
 
 
@@ -232,9 +266,9 @@ class TestTemporalContext:
         for _ in range(4):
             n1.process_turn(nations)
         # Score the same dummy input through both
-        dummy = [0.5] * n0.civilian_ai.n_inputs
-        scores_n0 = n0.civilian_ai.predict(dummy)
-        scores_n1 = n1.civilian_ai.predict(dummy)
+        dummy = [0.5] * civ_overseer(n0).n_inputs
+        scores_n0 = civ_overseer(n0).predict(dummy)
+        scores_n1 = civ_overseer(n1).predict(dummy)
         # After several training steps the LoRA adaptations will differ
         assert scores_n0 != scores_n1, (
             "Both nations produced identical scores after divergent histories — "
@@ -245,7 +279,7 @@ class TestTemporalContext:
         """The controller buffer must have exactly 5 entries after 10 predict calls."""
         nations = make_world()
         n = list(nations.values())[0]
-        ai = n.civilian_ai
+        ai = civ_overseer(n)
         initial_buf_len = len(ai._buffer)
         assert initial_buf_len == 5   # pre-filled with zeros
         # Repeatedly predict — buffer must stay at maxlen=5
@@ -267,7 +301,7 @@ class TestBaseModelUpdate:
         """Run enough turns to fill the civilian replay buffer, then verify
         that step_all_base_models actually changes the base model weights."""
         nations = make_world()
-        civilian_base = list(nations.values())[0].civilian_ai.base
+        civilian_base = civ_overseer(list(nations.values())[0]).base
 
         # Fill the replay buffer beyond the batch size
         n_turns = RoleBaseModel._BATCH_SIZE + 5
@@ -286,7 +320,7 @@ class TestBaseModelUpdate:
     def test_base_weights_finite_after_update(self):
         """No NaN or Inf should appear in base model weights after training."""
         nations = make_world()
-        civilian_base = list(nations.values())[0].civilian_ai.base
+        civilian_base = civ_overseer(list(nations.values())[0]).base
         buf = [[0.1] * civilian_base.model.input_dim] * 5
         for i in range(RoleBaseModel._BATCH_SIZE + 1):
             civilian_base.add_experience((buf, i % 3, 1.0, buf))
@@ -312,7 +346,7 @@ class TestSimulationLoop:
         the replay buffer grows during a full century."""
         from worldsim.engine import SimulationLoop
         nations = make_world()
-        civilian_base = list(nations.values())[0].civilian_ai.base
+        civilian_base = civ_overseer(list(nations.values())[0]).base
         baseline = len(civilian_base._replay)
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
@@ -333,10 +367,10 @@ class TestSimulationLoop:
         from worldsim.engine import SimulationLoop
         nations = make_world()
         n = list(nations.values())[0]
-        b_before = n.civilian_ai.lora_B_out.data.clone()
+        b_before = civ_overseer(n).lora_B_out.data.clone()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
-        b_after = n.civilian_ai.lora_B_out.data.clone()
+        b_after = civ_overseer(n).lora_B_out.data.clone()
         assert not torch.allclose(b_before, b_after)
 
 
@@ -398,7 +432,7 @@ class TestPersistence:
         from worldsim.ai.persistence import merge_and_save_models, load_model_seeds
 
         nations = make_world()
-        civ_base = list(nations.values())[0].civilian_ai.base
+        civ_base = civ_overseer(list(nations.values())[0]).base
 
         # Train the base model a bit
         buf = [[0.2] * civ_base.model.input_dim] * 5
@@ -411,7 +445,7 @@ class TestPersistence:
 
         # Create a fresh world with untrained base models
         nations2 = make_world()
-        civ_base2 = list(nations2.values())[0].civilian_ai.base
+        civ_base2 = civ_overseer(list(nations2.values())[0]).base
 
         # The fresh base may have different random init — corrupt to zeros
         with torch.no_grad():
@@ -432,20 +466,21 @@ class TestPersistence:
         # Train a few turns to diverge LoRA from zero
         for _ in range(3):
             n.process_turn(nations)
-        b_out_saved = n.civilian_ai.lora_B_out.data.clone()
+        b_out_saved = civ_overseer(n).lora_B_out.data.clone()
 
+        # The controller derives per-sub-model paths from this base path.
         lora_path = tmp_path / "civ_lora.yml"
         n.civilian_ai.save_table(lora_path)
 
-        # New controller with zeroed LoRA
+        # New controller with zeroed overseer LoRA
         nations2 = make_world()
         n2 = list(nations2.values())[0]
         with torch.no_grad():
-            n2.civilian_ai.lora_B_out.zero_()
+            civ_overseer(n2).lora_B_out.zero_()
         n2.civilian_ai.load_table(lora_path)
 
         assert torch.allclose(
-            n2.civilian_ai.lora_B_out,
+            civ_overseer(n2).lora_B_out,
             b_out_saved,
         ), "Per-nation LoRA B_out not restored after save_table/load_table"
 
@@ -473,7 +508,8 @@ class TestSaveCompat:
         nations = make_world()
         # Confirm all AI controllers are torch-based
         for n in nations.values():
-            assert isinstance(n.civilian_ai, TorchDomesticPolicyAI)
+            assert isinstance(n.civilian_ai, CivilianController)
+            assert isinstance(n.civilian_ai.overseer, TorchCivilianOverseer)
         # This used to crash because _build_merged_payload accessed .n_actions
         try:
             merge_and_save_models(nations, tmp_path)
@@ -555,7 +591,7 @@ class TestMetaGAIntegration:
         from worldsim.engine import SimulationLoop
         nations = make_world()
         n = list(nations.values())[0]
-        eps_before = n.civilian_ai.epsilon
+        eps_before = civ_overseer(n).epsilon
 
         # Give the nation a stable start so it receives a positive score
         n.stability = 80.0
@@ -565,7 +601,7 @@ class TestMetaGAIntegration:
         # epsilon should have changed (possibly decreased for positive-scoring
         # nations, or stayed at base for zero-fitness genomes)
         # We just verify it's within valid range and is finite
-        assert 0.0 <= n.civilian_ai.epsilon <= 1.0
+        assert 0.0 <= civ_overseer(n).epsilon <= 1.0
 
     def test_evolve_meta_mutates_lora(self):
         """evolve_meta() must apply Gaussian noise to all RNN controller LoRAs."""
@@ -577,9 +613,9 @@ class TestMetaGAIntegration:
         for _ in range(3):
             n.process_turn(nations)
 
-        b_before = n.civilian_ai.lora_B_out.data.clone()
+        b_before = civ_overseer(n).lora_B_out.data.clone()
         n.evolve_meta()
-        b_after  = n.civilian_ai.lora_B_out.data.clone()
+        b_after  = civ_overseer(n).lora_B_out.data.clone()
 
         # With sigma=0.02 and a non-trivial tensor, the tensors should differ
         # (statistically impossible for all elements to hit exactly zero noise)
@@ -594,10 +630,10 @@ class TestMetaGAIntegration:
         # Train to accumulate Adam state
         for _ in range(5):
             n.process_turn(nations)
-        old_state_len = len(n.civilian_ai._lora_optimizer.state)
+        old_state_len = len(civ_overseer(n)._lora_optimizer.state)
         n.evolve_meta()
         # After reset, Adam state should be empty
-        assert len(n.civilian_ai._lora_optimizer.state) == 0, (
+        assert len(civ_overseer(n)._lora_optimizer.state) == 0, (
             f"Optimizer state not cleared after evolve_meta; "
             f"had {old_state_len} entries before reset"
         )
@@ -614,7 +650,7 @@ class TestMetaGAIntegration:
         from worldsim.ai.rnn import sync_all_meta_ga
         sync_all_meta_ga(nations)
 
-        assert n.civilian_ai._reward_scale > 1.0, (
+        assert civ_overseer(n)._reward_scale > 1.0, (
             "reward_scale not increased after positive fitness sync"
         )
 
@@ -627,8 +663,8 @@ class TestMetaGAIntegration:
         loop.step()
         loop.step()
         for n in nations.values():
-            assert 0.0 <= n.civilian_ai.epsilon <= 1.0
-            assert 0.5 <= n.civilian_ai._reward_scale <= 2.0
+            assert 0.0 <= civ_overseer(n).epsilon <= 1.0
+            assert 0.5 <= civ_overseer(n)._reward_scale <= 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -642,9 +678,9 @@ class TestNumericalHealth:
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
-        dummy_civ = [0.5] * list(nations.values())[0].civilian_ai.n_inputs
+        dummy_civ = [0.5] * civ_overseer(list(nations.values())[0]).n_inputs
         for n in nations.values():
-            scores = n.civilian_ai.predict(dummy_civ)
+            scores = civ_overseer(n).predict(dummy_civ)
             assert all(math.isfinite(s) for s in scores), (
                 f"Non-finite score in nation {n.name} civilian AI"
             )
@@ -655,7 +691,7 @@ class TestNumericalHealth:
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
-        civ_base = list(nations.values())[0].civilian_ai.base
+        civ_base = civ_overseer(list(nations.values())[0]).base
         for p in civ_base.model.parameters():
             assert torch.all(torch.isfinite(p.data)), (
                 "NaN/Inf in civilian base model after one century"

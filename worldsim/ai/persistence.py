@@ -128,7 +128,19 @@ def _build_merged_payload(policies: list) -> Optional[Dict]:
     architecture are merged.  Memories are interleaved from all compatible
     policies for maximum diversity.
     Returns ``None`` if the list is empty or no compatible policies exist.
+
+    Only NelderMeadPolicy-style controllers expose the
+    ``(n_inputs, n_actions, network, memory, scales)`` interface this merger
+    needs.  Torch RNN controllers and the hierarchical ``CivilianController``
+    are persisted separately (see the ``torch_bases/`` handling in
+    :func:`merge_and_save_models`), so anything lacking that interface is
+    skipped rather than crashing the merge.
     """
+    policies = [
+        p for p in policies
+        if hasattr(p, "n_actions") and hasattr(p, "network")
+        and hasattr(p, "memory") and hasattr(p, "scales")
+    ]
     if not policies:
         return None
 
@@ -359,6 +371,16 @@ def merge_and_save_models(
         with open(seed_dir / "seed_fleet.yml", "w", encoding="utf8") as fh:
             _yaml.safe_dump(fleet_payload, fh, default_flow_style=False)
 
+    # --- torch RNN base models (shared backbone per role × dims) ---
+    # The PyTorch controllers don't fit the NelderMead seed format; persist
+    # their shared base models as a directory of .pt checkpoints instead.
+    try:
+        from .rnn import rnn_available, save_all_base_models
+        if rnn_available():
+            save_all_base_models(seed_dir / "torch_bases")
+    except Exception:
+        pass
+
     # --- GA seed ---
     _save_ga_seed(nations, seed_dir / "seed_ga.json")
 
@@ -421,6 +443,16 @@ def load_model_seeds(
                             pass
         except OSError:
             pass
+
+    # --- torch RNN base models ---
+    try:
+        from .rnn import rnn_available, load_all_base_models
+        bases_dir = seed_dir / "torch_bases"
+        if rnn_available() and bases_dir.exists():
+            load_all_base_models(bases_dir)
+            loaded = True
+    except Exception:
+        pass
 
     # --- GA seed ---
     ga_path = seed_dir / "seed_ga.json"

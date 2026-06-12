@@ -7,14 +7,21 @@ class keeps thin wrapper methods so existing call sites are unaffected.
 Action space
 ------------
 The 22 civilian actions are organised into six *departments*.  Each
-department is a natural sub-model boundary: eventually the current
-``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` will act as an overseer
-that picks which department handles a given turn, while dedicated per-
-department models handle the fine-grained choice within that space.
+department is its own sub-model: an :class:`CivilianController` overseer
+picks which department handles a given turn (a 6-way choice), and a
+dedicated per-department model then makes the fine-grained choice within
+that department's local action sub-space.
 
-For now the single existing model still selects from all 22 actions using
-their flat global indices (0–21).  The department structure is metadata
-only — no behaviour changes.
+Each department is backed by a distinct model — for the PyTorch backend a
+separate shared base model keyed ``"civilian_{slug}"`` (see
+``TorchDepartmentAI``), for the Nelder-Mead backend a separate
+``DepartmentPolicyAI`` — so departments specialise independently while
+nations within a department still share a backbone.  The overseer and every
+department model are trained on the same per-turn reward signal.
+
+The legacy flat ``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` (selecting
+from all 22 actions via their global indices) is still supported as a
+fallback when a bare policy is passed in place of a ``CivilianController``.
 
 Department layout
 -----------------

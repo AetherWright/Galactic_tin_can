@@ -480,18 +480,53 @@ class RNNController:
         if not path.exists():
             return
         sd = torch.load(path, map_location=_DEVICE, weights_only=True)
-        if "lora_A_in"    in sd: self.lora_A_in.data.copy_(sd["lora_A_in"])
-        if "lora_B_in"    in sd: self.lora_B_in.data.copy_(sd["lora_B_in"])
-        if "lora_A_out"   in sd: self.lora_A_out.data.copy_(sd["lora_A_out"])
-        if "lora_B_out"   in sd: self.lora_B_out.data.copy_(sd["lora_B_out"])
-        if "target_A_in"  in sd: self._target_A_in.copy_(sd["target_A_in"])
-        if "target_B_in"  in sd: self._target_B_in.copy_(sd["target_B_in"])
-        if "target_A_out" in sd: self._target_A_out.copy_(sd["target_A_out"])
-        if "target_B_out" in sd: self._target_B_out.copy_(sd["target_B_out"])
+
+        # Restore the online LoRA parameters.  The war controller's input
+        # dimension tracks the live nation count, so a checkpoint may have
+        # been written at a different size than the freshly-constructed
+        # controller.  When the saved shape differs we rebuild the parameter
+        # rather than calling ``copy_`` (which would raise on a size mismatch).
+        shape_changed = False
+        for name in ("lora_A_in", "lora_B_in", "lora_A_out", "lora_B_out"):
+            if name not in sd:
+                continue
+            saved = sd[name].to(_DEVICE)
+            param = getattr(self, name)
+            if tuple(param.shape) != tuple(saved.shape):
+                setattr(self, name, nn.Parameter(saved.clone()))
+                shape_changed = True
+            else:
+                param.data.copy_(saved)
+
+        # The frozen target tensors are plain tensors saved alongside the
+        # online weights; assign clones so any shape change is absorbed.
+        for tname, key in (
+            ("_target_A_in",  "target_A_in"),
+            ("_target_B_in",  "target_B_in"),
+            ("_target_A_out", "target_A_out"),
+            ("_target_B_out", "target_B_out"),
+        ):
+            if key in sd:
+                setattr(self, tname, sd[key].to(_DEVICE).clone())
+
         if "h"            in sd: self._h = sd["h"]
         if "train_steps"  in sd: self._train_steps  = int(sd["train_steps"])
         if "reward_scale" in sd: self._reward_scale = float(sd["reward_scale"])
         if "genome_id"    in sd: self._genome_id    = int(sd["genome_id"])
+
+        if shape_changed:
+            # Input/output dimensions are implied by the LoRA shapes.  Realign
+            # the controller (shared base model, optimizer, rolling buffer) so
+            # subsequent forward/training passes use consistent shapes.
+            self.n_inputs  = self.lora_A_in.shape[1]
+            self.n_outputs = self.lora_B_out.shape[0]
+            self.base = get_role_model(
+                self.role, self.n_inputs, self.hidden_dim, self.n_outputs
+            )
+            self.reset_lora_optimizer()
+            self._buffer = deque(
+                [[0.0] * self.n_inputs] * BUFFER_SIZE, maxlen=BUFFER_SIZE
+            )
 
 # -----------------------------------------------------------------------
 # Base class adding save_table / load_table compatibility shims

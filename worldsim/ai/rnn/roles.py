@@ -57,13 +57,32 @@ class TorchWarAI(_RoleController):
         self.lora_A_in  = nn.Parameter(torch.empty(self.lora_r, new_n, device=_DEVICE))
         self.lora_B_in  = nn.Parameter(torch.zeros(self.hidden_dim, self.lora_r, device=_DEVICE))
         nn.init.kaiming_uniform_(self.lora_A_in, a=math.sqrt(5))
+        # Rebuild the frozen target tensors so they match the new input
+        # dimension.  Without this they keep the old shape and the next
+        # Double-DQN forward / target-network sync raises a shape mismatch —
+        # which is why the war controller never trained or saved cleanly once
+        # the live nation count changed.
+        with torch.no_grad():
+            self._target_A_in = self.lora_A_in.data.clone()
+            self._target_B_in = self.lora_B_in.data.clone()
         self._lora_optimizer = optim.Adam(
             [self.lora_A_in, self.lora_B_in,
              self.lora_A_out, self.lora_B_out],
-            lr=self._LR_LORA,
+            lr=self._lr_lora,
         )
         self._buffer = deque([[0.0] * new_n] * BUFFER_SIZE, maxlen=BUFFER_SIZE)
         self._h = torch.zeros(1, 1, self.hidden_dim, device=_DEVICE)
+
+    def load_lora(self, path: Path) -> None:
+        """Restore weights, then realign ``allies_dim`` with the loaded size.
+
+        A checkpoint may have been written at a different nation count; the
+        base loader adopts the saved input dimension, so keep ``allies_dim``
+        in step to avoid a spurious rebuild on the next
+        :meth:`set_allies_dimension` call (which would discard the weights).
+        """
+        super().load_lora(path)
+        self.allies_dim = max(1, self.n_inputs - 4 - self.grid_feature_count)
 
     @staticmethod
     def create_doctrine() -> str:
