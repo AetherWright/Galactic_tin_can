@@ -8,12 +8,12 @@ from typing import Dict, Optional, Set, Tuple, TYPE_CHECKING, Any, Iterator
 from collections import defaultdict
 import random
 
-from ..routes import RouteGraph
+from ..core.routing import RouteGraph
 from .terrain import BIOMES, generate_resources
 
 if TYPE_CHECKING:
-    from .city import City
-    from .infrastructure import (
+    from .demographics.city import City
+    from .buildings import (
         MilitaryBase,
         Mine,
         Farm,
@@ -28,10 +28,10 @@ if TYPE_CHECKING:
         NuclearFacility,
     )
 
-from .city import City
-from .colony import Colony
-from .county import County
-from .infrastructure import (
+from .demographics.city import City
+from .demographics.colony import Colony
+from .demographics.county import County
+from .buildings import (
     MilitaryBase,
     Mine,
     Port,
@@ -46,7 +46,7 @@ from .infrastructure import (
     OrbitalDefense,
     Farm,
 )
-from ..utils import distance, travel_time, APPROXIMATE
+from ..core import distance, travel_time, APPROXIMATE
 
 
 @dataclass

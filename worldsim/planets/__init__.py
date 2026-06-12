@@ -1,16 +1,21 @@
-"""Planetary models and registries.
+"""The planetary arm: surfaces, settlements and population dynamics.
 
-The package exposes the pure Python :class:`Planet` implementation. Older
-releases offered an optional Java helper, but that code has been removed in
-favour of Rust and Python alternatives. ``set_use_java`` remains for backward
-compatibility but no longer changes behaviour.
+Submodules
+----------
+``registry``      the global ``PLANETS`` registry
+``planet``        planet state and the surface/settlement pipeline
+``terrain``       biome definitions and biome resource tables
+``surface``       procedural heightmaps, resource heatmaps and storms
+``mining``        mine aging, terrain deformation and depletion
+``demographics``  city / colony / county population models
+``buildings``     physical structures placed on planet surfaces
 """
 
 from __future__ import annotations
 
 from .registry import PLANETS
 from .terrain import BIOMES
-from .heightmap import (
+from .surface import (
     TERRAIN_DEEP_OCEAN,
     TERRAIN_OCEAN,
     TERRAIN_COAST,
@@ -20,21 +25,15 @@ from .heightmap import (
     TERRAIN_PEAK,
     TERRAIN_NAMES,
 )
-
-# The simulation now relies solely on the Python planet code.
-USE_JAVA_PLANETS = False
 from .planet import Planet
-
-
-def set_use_java(flag: bool) -> None:  # noqa: D401 -- kept for API compatibility
-    """No-op retained for compatibility."""
-    global USE_JAVA_PLANETS
-    USE_JAVA_PLANETS = False
-
-from .city import City, process_city_batch
-from .colony import Colony, process_colony_batch
-from .county import County
-from .infrastructure import (
+from .demographics import (
+    City,
+    Colony,
+    County,
+    process_city_batch,
+    process_colony_batch,
+)
+from .buildings import (
     School,
     PowerPlant,
     ResearchLab,
@@ -62,8 +61,6 @@ __all__ = [
     'TERRAIN_MOUNTAIN',
     'TERRAIN_PEAK',
     'TERRAIN_NAMES',
-    'USE_JAVA_PLANETS',
-    'set_use_java',
     'City',
     'process_city_batch',
     'Colony',
