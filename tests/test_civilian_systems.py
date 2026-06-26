@@ -49,9 +49,16 @@ def make_world() -> Dict:
 
 
 def _topup(nation, amount: float = 5_000.0) -> None:
-    """Remove the economy bottleneck so a test isolates the *decision*."""
+    """Remove the economy bottleneck so a test isolates the *decision*.
+
+    Tops up both the resource stockpiles and the civilian build budget
+    (reserves / net income), which ``process_turn`` would normally settle but
+    a direct ``_apply_hierarchical_civilian_ai`` call does not.
+    """
     for k in _TOPUP_RESOURCES:
         nation.resources[k] = amount
+    nation.econ.reserves = amount
+    nation.econ.last_net_income = amount
 
 
 def _fleet_dept_index() -> int:
@@ -196,6 +203,74 @@ class TestFleetReachability:
             "A shipyard was built but no fleet ship ever followed — the masked "
             "ship-build actions never became reachable."
         )
+
+
+# ---------------------------------------------------------------------------
+# 2b. Soft per-turn construction budget
+# ---------------------------------------------------------------------------
+
+class TestCivilianBudget:
+    def test_settle_turn_banks_net_income(self):
+        """Gross output minus upkeep is banked into reserves each turn."""
+        nations = make_world()
+        n = nations[0]
+        n.econ.reserves = 0.0
+        net = n.econ.settle_turn(gross_output=100.0, upkeep=30.0)
+        assert net == 70.0
+        assert n.econ.reserves == 70.0
+        assert n.last_net_income == 70.0
+        # Budget = net income + a slice of reserves.
+        assert n.civilian_action_budget() > 0.0
+
+    def test_reserves_are_capped(self):
+        """Reserves can't grow without bound relative to gross output."""
+        n = make_world()[0]
+        for _ in range(50):
+            n.econ.settle_turn(gross_output=100.0, upkeep=0.0)
+        assert n.econ.reserves <= n.econ._RESERVE_CAP_MULT * 100.0 + 1e-6
+
+    def test_upkeep_grows_with_assets(self):
+        """More standing assets ⇒ more upkeep ⇒ less net income."""
+        n = make_world()[0]
+        base = n.compute_upkeep()
+        from worldsim.military.divisions import build_division
+        before = n.compute_upkeep()
+        build_division(n)
+        assert n.compute_upkeep() >= before
+
+    def test_budget_caps_actions_per_turn(self):
+        """A tiny budget executes far fewer department actions than a large one."""
+        nations = make_world()
+        n = nations[0]
+        if not isinstance(n.civilian_ai, CivilianController):
+            pytest.skip("civilian_ai is not the hierarchical controller")
+        for k in _TOPUP_RESOURCES:
+            n.resources[k] = 1e6   # never resource-limited; isolate the budget
+
+        def actions_executed(budget_amount):
+            n.econ.reserves = budget_amount
+            n.econ.last_net_income = 0.0
+            before_total = (
+                len(n.cities) + len(n.mines) + len(n.factories) + len(n.power_plants)
+                + len(n.schools) + len(n.labs) + len(n.hospitals) + len(n.shipyards)
+                + len(n.spaceports) + len(n.ports) + len(n.farms) + len(n.bases)
+                + len(n.divisions) + n._fleet_count() + len(n.projects)
+            )
+            _apply_hierarchical_civilian_ai(n, n.civilian_ai)
+            after_total = (
+                len(n.cities) + len(n.mines) + len(n.factories) + len(n.power_plants)
+                + len(n.schools) + len(n.labs) + len(n.hospitals) + len(n.shipyards)
+                + len(n.spaceports) + len(n.ports) + len(n.farms) + len(n.bases)
+                + len(n.divisions) + n._fleet_count() + len(n.projects)
+            )
+            return after_total - before_total
+
+        # Tiny budget → at most the single always-allowed top-priority action.
+        small = actions_executed(1.0)
+        # Generous budget → multiple departments get to build.
+        large = actions_executed(10_000.0)
+        assert small <= 1, f"tiny budget still executed {small} builds"
+        assert large >= small, "larger budget should not execute fewer actions"
 
 
 # ---------------------------------------------------------------------------

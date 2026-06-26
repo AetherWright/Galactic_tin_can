@@ -352,6 +352,60 @@ def _valid_action_mask(nation: "Nation") -> List[bool]:
 # Main AI loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-action cost weights — used by the soft civilian build budget.
+# A weight approximates how "expensive" an action is (sum of its resource
+# cost); actions that don't draw on the resource pool get a flat default.
+# ---------------------------------------------------------------------------
+
+_ACTION_WEIGHTS: Dict[str, float] = {}
+_DEFAULT_ACTION_WEIGHT: float = 20.0
+
+
+def _build_action_weights() -> Dict[str, float]:
+    from .construction import RESOURCE_COSTS
+    from ..military.fleets import SHIP_TEMPLATES
+
+    def _csum(d: Dict[str, float]) -> float:
+        return float(sum(d.values()))
+
+    w: Dict[str, float] = {
+        "build_city":           _csum(RESOURCE_COSTS["city"]),
+        "build_hospital":       _csum(RESOURCE_COSTS["hospital"]),
+        "build_school":         _csum(RESOURCE_COSTS["school"]),
+        "upgrade_assets":       20.0,
+        "build_mine":           _csum(RESOURCE_COSTS["mine"]),
+        "build_port":           _csum(RESOURCE_COSTS["port"]),
+        "build_factory":        _csum(RESOURCE_COSTS["factory"]),
+        "build_power_plant":    _csum(RESOURCE_COSTS["power_plant"]),
+        "build_farm":           _csum(RESOURCE_COSTS["farm"]),
+        "build_base":           _csum(RESOURCE_COSTS["base"]),
+        "build_nuke_facility":  _csum(RESOURCE_COSTS["nuke_facility"]),
+        "build_orbital_defense": _csum(RESOURCE_COSTS["orbital_defense"]),
+        "build_division":       25.0,
+        "build_shipyard":       _csum(RESOURCE_COSTS["shipyard"]),
+        "build_fleet_ship_frigate":    _csum(SHIP_TEMPLATES["Frigate"].build_cost),
+        "build_fleet_ship_transport":  _csum(SHIP_TEMPLATES["Transport"].build_cost),
+        "build_fleet_ship_cruiser":    _csum(SHIP_TEMPLATES["Cruiser"].build_cost),
+        "build_fleet_ship_battleship": _csum(SHIP_TEMPLATES["Battleship"].build_cost),
+        "build_spaceport":      _csum(RESOURCE_COSTS["spaceport"]),
+        "build_lab":            _csum(RESOURCE_COSTS["lab"]),
+        "colonize_planet":      30.0,
+        "start_project":        50.0,
+    }
+    return w
+
+
+def _action_cost_weight(name: str) -> float:
+    global _ACTION_WEIGHTS
+    if not _ACTION_WEIGHTS:
+        try:
+            _ACTION_WEIGHTS = _build_action_weights()
+        except Exception:
+            _ACTION_WEIGHTS = {}
+    return _ACTION_WEIGHTS.get(name, _DEFAULT_ACTION_WEIGHT)
+
+
 def _overseer_priority(
     ctrl: CivilianController, state: List[float], dept_valid: List[bool]
 ) -> List[int]:
@@ -400,6 +454,13 @@ def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) 
 
     order = _overseer_priority(ctrl, state0, dept_valid)
 
+    # Soft per-turn budget: a nation only commits roughly what it can afford
+    # (net income + a slice of reserves).  High-priority departments spend
+    # first; once the budget is exhausted the rest stand down.  The top
+    # priority always gets to act so a poor nation is never fully paralysed.
+    budget = nation.civilian_action_budget() if hasattr(nation, "civilian_action_budget") else float("inf")
+    spent = 0.0
+
     dept_rewards: Dict[int, float] = {}
     first = True
     for dept_idx in order:
@@ -411,11 +472,18 @@ def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) 
 
         s         = _civilian_state(nation)
         local_idx = dept_model.choose_action(s, local_valid)
-        global_idx = dept.actions[local_idx].idx
+        action    = dept.actions[local_idx]
+        weight    = _action_cost_weight(action.name)
+        # Stop once the budget is spent — but always allow the first action.
+        if not first and spent + weight > budget:
+            break
+
+        global_idx = action.idx
         if first:
             nation.last_civilian_action = global_idx
             first = False
         _execute_civilian_action(nation, global_idx)
+        spent += weight
 
         ns     = _civilian_state(nation)
         reward = nation.compute_reward("civilian", s, ns)
@@ -426,6 +494,9 @@ def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) 
     # reward that department's action actually produced.  This makes the
     # overseer's per-department Q-values (and therefore the priority order)
     # track which departments pay off in the current state.
+    if spent and hasattr(nation, "draw_civilian_budget"):
+        nation.draw_civilian_budget(spent)
+
     new_state = _civilian_state(nation)
     for dept_idx, reward in dept_rewards.items():
         ctrl.overseer.train(state0, dept_idx, reward, new_state)
