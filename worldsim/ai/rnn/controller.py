@@ -95,6 +95,11 @@ class RNNController:
     _FITNESS_SCALE:     float = 80.0
     # Floor on epsilon even for very high-fitness genomes
     _EPSILON_FLOOR:     float = 0.02
+    # Dynamic LoRA learning-rate warmup (only active when dynamic_lr=True):
+    # a fresh controller starts at (1 + BOOST)×base lr and decays back to base
+    # over ~WARMUP_STEPS train calls, so freshly-seeded models learn rapidly.
+    _LR_WARMUP_BOOST:   float = 4.0
+    _LR_WARMUP_STEPS:   float = 100.0
 
     def __init__(
         self,
@@ -109,6 +114,7 @@ class RNNController:
         gamma:      float = _GAMMA,
         lr_lora:    float = _LR_LORA,
         seed:       Optional[int] = None,
+        dynamic_lr: bool  = False,
     ) -> None:
         self.role       = role
         self.n_inputs   = n_inputs
@@ -142,6 +148,7 @@ class RNNController:
             lr=lr_lora,
         )
         self._lr_lora = lr_lora
+        self._dynamic_lr = dynamic_lr
 
         # Double DQN target network — frozen copies of online LoRA
         with torch.no_grad():
@@ -365,7 +372,14 @@ class RNNController:
             target[0, action] = target_val
             loss = F.mse_loss(cur_scores, target)
 
-            # Update LoRA
+            # Update LoRA (with optional fresh-start learning-rate warmup)
+            if self._dynamic_lr:
+                warm = self._lr_lora * (
+                    1.0 + self._LR_WARMUP_BOOST
+                    * math.exp(-self._train_steps / self._LR_WARMUP_STEPS)
+                )
+                for g in self._lora_optimizer.param_groups:
+                    g["lr"] = warm
             self._lora_optimizer.zero_grad()
             loss.backward()
             self._lora_optimizer.step()
@@ -549,10 +563,11 @@ class _RoleController(RNNController):
         epsilon:    float,
         gamma:      float,
         seed:       Optional[int] = None,
+        dynamic_lr: bool = False,
     ) -> None:
         super().__init__(
             role, n_inputs, n_outputs, hidden_dim,
-            epsilon=epsilon, gamma=gamma, seed=seed,
+            epsilon=epsilon, gamma=gamma, seed=seed, dynamic_lr=dynamic_lr,
         )
         self.table_path = Path(table_path) if table_path else None
         if self.table_path:

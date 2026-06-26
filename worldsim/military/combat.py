@@ -8,7 +8,12 @@ from typing import Dict, List, TYPE_CHECKING
 from ..ai.representations import build_alliance_matrix, galactic_control_layers
 from ..core import distance, wprint
 from ..planets import PLANETS
-from .divisions import Division, move_division, reward_divisions
+from .divisions import (
+    Division,
+    move_division,
+    reward_divisions,
+    _apply_city_casualties,
+)
 from .logistics import (
     _attrition_multiplier,
     _combat_readiness,

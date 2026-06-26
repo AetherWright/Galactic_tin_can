@@ -763,3 +763,26 @@ class TestNumericalHealth:
             assert torch.all(torch.isfinite(p.data)), (
                 "NaN/Inf in civilian base model after one century"
             )
+
+
+# ---------------------------------------------------------------------------
+# 11. Combat casualty cascade wiring
+# ---------------------------------------------------------------------------
+
+class TestCombatWiring:
+    def test_apply_city_casualties_is_importable_in_combat(self):
+        """combat.py calls _apply_city_casualties on every battle with losses;
+        it must be bound in the module namespace (it lives in divisions.py)."""
+        import worldsim.military.combat as combat
+        assert hasattr(combat, "_apply_city_casualties"), (
+            "_apply_city_casualties missing from combat namespace — "
+            "casualty cascade would NameError mid-battle"
+        )
+
+    def test_battle_with_casualties_does_not_raise(self):
+        """A division battle that produces casualties must not crash."""
+        from worldsim.military.combat import _apply_city_casualties
+        nations = make_world()
+        n = list(nations.values())[0]
+        # Should run without NameError regardless of city state.
+        _apply_city_casualties(n, 10)

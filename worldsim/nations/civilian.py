@@ -352,31 +352,83 @@ def _valid_action_mask(nation: "Nation") -> List[bool]:
 # Main AI loop
 # ---------------------------------------------------------------------------
 
+def _overseer_priority(
+    ctrl: CivilianController, state: List[float], dept_valid: List[bool]
+) -> List[int]:
+    """Return valid department indices ordered by overseer preference.
+
+    The overseer scores all departments for *state*; valid departments are
+    returned highest-priority first.  Calling ``predict`` here also primes the
+    overseer's recurrent buffer with *state* so the subsequent ``train`` calls
+    operate on the correct context.  Falls back to natural order if the model
+    has no ``predict`` (defensive).
+    """
+    valid_idx = [i for i in range(len(DEPARTMENTS)) if dept_valid[i]]
+    predict = getattr(ctrl.overseer, "predict", None)
+    if predict is None:
+        return valid_idx
+    scores = predict(state)
+    valid_idx.sort(
+        key=lambda i: scores[i] if i < len(scores) else float("-inf"),
+        reverse=True,
+    )
+    return valid_idx
+
+
 def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) -> None:
-    """Two-level action selection: overseer picks department, dept model picks action."""
-    state = _civilian_state(nation)
+    """Priority-ordered civilian turn.
+
+    Departments do not take turns — each turn the *overseer* ranks them by
+    priority and every valid department then acts once in that order.  Because
+    each build checks resources, the high-priority departments spend first and
+    lower-priority ones get whatever is left (resource prioritisation rather
+    than a single winner).
+
+    Every department model **and** the overseer train each turn — the overseer
+    learns a per-department value (which shapes the priority order) and no
+    department is starved of training data the way single-routing did.
+    """
+    state0 = _civilian_state(nation)
 
     # A department is valid iff it has at least one currently valid action.
     dept_valid = [
         any(a.mask_fn(nation) for a in dept.actions)
         for dept in DEPARTMENTS
     ]
-    dept_local_idx = ctrl.overseer.choose_action(state, dept_valid)
-    dept = DEPARTMENTS[dept_local_idx]
+    if not any(dept_valid):
+        return
 
-    dept_model  = ctrl.dept_models[dept.slug]
-    local_valid = [a.mask_fn(nation) for a in dept.actions]
-    local_idx   = dept_model.choose_action(state, local_valid)
+    order = _overseer_priority(ctrl, state0, dept_valid)
 
-    global_idx = dept.actions[local_idx].idx
-    nation.last_civilian_action = global_idx
-    _execute_civilian_action(nation, global_idx)
+    dept_rewards: Dict[int, float] = {}
+    first = True
+    for dept_idx in order:
+        dept       = DEPARTMENTS[dept_idx]
+        dept_model = ctrl.dept_models[dept.slug]
+        local_valid = [a.mask_fn(nation) for a in dept.actions]
+        if not any(local_valid):
+            continue
 
+        s         = _civilian_state(nation)
+        local_idx = dept_model.choose_action(s, local_valid)
+        global_idx = dept.actions[local_idx].idx
+        if first:
+            nation.last_civilian_action = global_idx
+            first = False
+        _execute_civilian_action(nation, global_idx)
+
+        ns     = _civilian_state(nation)
+        reward = nation.compute_reward("civilian", s, ns)
+        dept_model.train(s, local_idx, reward, ns)
+        dept_rewards[dept_idx] = reward
+
+    # Train the overseer on every department it ranked this turn, using the
+    # reward that department's action actually produced.  This makes the
+    # overseer's per-department Q-values (and therefore the priority order)
+    # track which departments pay off in the current state.
     new_state = _civilian_state(nation)
-    reward    = nation.compute_reward("civilian", state, new_state)
-
-    ctrl.overseer.train(state, dept_local_idx, reward, new_state)
-    dept_model.train(state, local_idx, reward, new_state)
+    for dept_idx, reward in dept_rewards.items():
+        ctrl.overseer.train(state0, dept_idx, reward, new_state)
 
 
 def _apply_civilian_ai(nation: "Nation") -> None:

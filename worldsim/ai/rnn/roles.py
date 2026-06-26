@@ -130,6 +130,7 @@ class TorchCivilianOverseer(_RoleController):
         super().__init__(
             "civilian_overseer", n_inputs, n_depts, 64,
             table_path=table_path, epsilon=epsilon, gamma=gamma,
+            dynamic_lr=True,
         )
 
 
@@ -154,6 +155,7 @@ class TorchDepartmentAI(_RoleController):
         super().__init__(
             f"civilian_{slug}", n_inputs, n_actions, 64,
             table_path=table_path, epsilon=epsilon, gamma=gamma,
+            dynamic_lr=True,
         )
         self.slug = slug
 
