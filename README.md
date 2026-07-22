@@ -29,9 +29,9 @@ worldsim/
 │   ├── strategic.py     — StrategicNelderMeadAI planner
 │   ├── rnn/             — GRU base models + per-nation LoRA adapters
 │   │   ├── base.py      — shared backbones, registry, replay training
-│   │   ├── controller.py— RNNController (Double DQN + MetaGA)
-│   │   └── roles.py     — Torch role wrappers
-│   ├── torch_fleet.py   — MLP fleet controller
+│   │   ├── controller.py— RNNController (Double DQN + MetaGA + dynamic LR warmup)
+│   │   └── roles.py     — Torch role wrappers (war, civilian overseer/dept, project,
+│   │                      diplomacy, research, doctrine, fleet)
 │   ├── native.py        — Rust/C++ perceptron banks for division controllers
 │   ├── neat.py/graph.py — NEAT topology evolution
 │   ├── meta_ga.py       — reward-weight genetic algorithm
@@ -51,12 +51,12 @@ worldsim/
 │   └── buildings.py     — physical structures on planet surfaces
 ├── society/             — culture, ideas, leaders, goals
 ├── nations/             — nation state and internal development
-│   ├── nation.py        — Nation dataclass, process_turn() pipeline
-│   ├── economy.py       — log-scale funds + resource stockpiles
+│   ├── nation.py        — Nation dataclass, process_turn() pipeline, upkeep
+│   ├── economy.py       — log-scale funds, resource stockpiles, treasury/reserves
 │   ├── government.py    — government forms and approval
 │   ├── projects.py      — national project catalogue
 │   ├── construction.py  — resource collection and build actions
-│   └── civilian.py      — departmental civilian AI action space
+│   └── civilian.py      — hierarchical civilian AI: overseer + 6 department models
 ├── military/            — armies, fleets and doctrine
 │   ├── divisions.py     — ground divisions and recruitment
 │   ├── logistics.py     — supply, readiness, attrition, stacking
@@ -267,16 +267,57 @@ Key observations:
 
 ## AI architecture
 
-Each nation runs seven GRU-based role controllers (war, civilian, project,
-diplomacy, research, doctrine, fleet).  All controllers share a single
-**base model** per role across all nations; each nation adds a lightweight
-**LoRA adapter** that specialises the backbone without touching its weights.
+Each nation runs a set of GRU-based role controllers: war, project, diplomacy,
+research, doctrine, fleet, and a **hierarchical civilian** pair (overseer +
+one model per department — see below), for 8 controllers total.  All
+controllers share a single **base model** per role across all nations; each
+nation adds a lightweight **LoRA adapter** that specialises the backbone
+without touching its weights.
 
 Training uses **Double DQN** with:
-- Per-nation Adam optimiser for LoRA parameters
+- Per-nation Adam optimiser for LoRA parameters, with an optional **dynamic
+  learning-rate warmup** (used by the civilian overseer and department
+  models): a freshly-constructed controller trains at up to 5× the base LR,
+  decaying back to base over its first ~100 training steps, so newly-seeded
+  nations pick up a workable policy quickly instead of learning at the same
+  slow rate as a long-lived one.
 - Shared replay buffer (8 000 transitions) per role for base model updates
 - Target network hard-copied every 16 training steps
 - MetaGA fitness modulates ε-greedy exploration and reward scaling
+
+### Hierarchical civilian AI
+
+The 21 civilian build actions are grouped into six departments — interior,
+industry, defense, fleet, science, executive — each backed by its own model
+(`civilian_{slug}`, sharing weights across nations the same way every other
+role does). An **overseer** model (`civilian_overseer`) scores all six
+departments against the current turn's state.
+
+Departments don't take turns: every turn, each department whose actions are
+currently valid gets to act once, **in the overseer's priority order** —
+highest-scored department first. This means the overseer expresses a
+*resource priority* (interior over industry this turn, say) rather than
+picking one winner and starving the rest. Both the overseer and every
+department model that acted are trained every turn, so — unlike a
+single-router design — no department goes without training data just because
+it wasn't picked.
+
+Turn-by-turn spending is bounded by a **soft budget** (see below): once the
+budget for the turn is exhausted, remaining lower-priority departments stand
+down, though the single highest-priority action is always allowed so a
+nation with no money isn't fully paralysed.
+
+### Soft economic budget
+
+`Economy` tracks a **treasury** (`reserves`) alongside the existing log-scaled
+`funds` gauge. Each turn, `settle_turn()` banks that turn's net income (gross
+output minus a lightweight per-turn **upkeep** charge for every standing
+building, division, and ship) into the treasury, floored at 0 and capped at
+5× gross output so it can't grow unbounded. The civilian AI's per-turn
+construction budget is net income plus a fixed slice of the treasury —
+richer, more established nations can fund several departments' worth of
+construction in one turn; poor or newly-founded ones are throttled back to
+their single top priority.
 
 ## Requirements
 

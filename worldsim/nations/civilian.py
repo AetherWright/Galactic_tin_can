@@ -6,21 +6,26 @@ class keeps thin wrapper methods so existing call sites are unaffected.
 
 Action space
 ------------
-The 22 civilian actions are organised into six *departments*.  Each
-department is its own sub-model: an :class:`CivilianController` overseer
-picks which department handles a given turn (a 6-way choice), and a
-dedicated per-department model then makes the fine-grained choice within
-that department's local action sub-space.
+The 21 civilian actions are organised into six *departments*.  Each
+department is its own sub-model.  Departments do not take turns: each turn an
+:class:`CivilianController` overseer scores all six departments against the
+current state, and every department with at least one currently valid action
+acts once, in that priority order (highest-scored department first) — a
+resource-prioritisation scheme rather than a single 6-way pick.  Spending is
+bounded by the nation's soft per-turn construction budget (see
+``Nation.civilian_action_budget``); once it is exhausted, remaining
+lower-priority departments stand down, though the single highest-priority
+action always goes through.  The overseer and every department that acted are
+trained every turn on the reward that department's action produced.
 
 Each department is backed by a distinct model — for the PyTorch backend a
 separate shared base model keyed ``"civilian_{slug}"`` (see
 ``TorchDepartmentAI``), for the Nelder-Mead backend a separate
 ``DepartmentPolicyAI`` — so departments specialise independently while
-nations within a department still share a backbone.  The overseer and every
-department model are trained on the same per-turn reward signal.
+nations within a department still share a backbone.
 
 The legacy flat ``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` (selecting
-from all 22 actions via their global indices) is still supported as a
+from all 21 actions via their global indices) is still supported as a
 fallback when a bare policy is passed in place of a ``CivilianController``.
 
 Department layout
