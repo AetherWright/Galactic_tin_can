@@ -6,15 +6,27 @@ class keeps thin wrapper methods so existing call sites are unaffected.
 
 Action space
 ------------
-The 22 civilian actions are organised into six *departments*.  Each
-department is a natural sub-model boundary: eventually the current
-``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` will act as an overseer
-that picks which department handles a given turn, while dedicated per-
-department models handle the fine-grained choice within that space.
+The 21 civilian actions are organised into six *departments*.  Each
+department is its own sub-model.  Departments do not take turns: each turn an
+:class:`CivilianController` overseer scores all six departments against the
+current state, and every department with at least one currently valid action
+acts once, in that priority order (highest-scored department first) — a
+resource-prioritisation scheme rather than a single 6-way pick.  Spending is
+bounded by the nation's soft per-turn construction budget (see
+``Nation.civilian_action_budget``); once it is exhausted, remaining
+lower-priority departments stand down, though the single highest-priority
+action always goes through.  The overseer and every department that acted are
+trained every turn on the reward that department's action produced.
 
-For now the single existing model still selects from all 22 actions using
-their flat global indices (0–21).  The department structure is metadata
-only — no behaviour changes.
+Each department is backed by a distinct model — for the PyTorch backend a
+separate shared base model keyed ``"civilian_{slug}"`` (see
+``TorchDepartmentAI``), for the Nelder-Mead backend a separate
+``DepartmentPolicyAI`` — so departments specialise independently while
+nations within a department still share a backbone.
+
+The legacy flat ``DomesticPolicyAI`` / ``TorchDomesticPolicyAI`` (selecting
+from all 21 actions via their global indices) is still supported as a
+fallback when a bare policy is passed in place of a ``CivilianController``.
 
 Department layout
 -----------------
@@ -345,31 +357,154 @@ def _valid_action_mask(nation: "Nation") -> List[bool]:
 # Main AI loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-action cost weights — used by the soft civilian build budget.
+# A weight approximates how "expensive" an action is (sum of its resource
+# cost); actions that don't draw on the resource pool get a flat default.
+# ---------------------------------------------------------------------------
+
+_ACTION_WEIGHTS: Dict[str, float] = {}
+_DEFAULT_ACTION_WEIGHT: float = 20.0
+
+
+def _build_action_weights() -> Dict[str, float]:
+    from .construction import RESOURCE_COSTS
+    from ..military.fleets import SHIP_TEMPLATES
+
+    def _csum(d: Dict[str, float]) -> float:
+        return float(sum(d.values()))
+
+    w: Dict[str, float] = {
+        "build_city":           _csum(RESOURCE_COSTS["city"]),
+        "build_hospital":       _csum(RESOURCE_COSTS["hospital"]),
+        "build_school":         _csum(RESOURCE_COSTS["school"]),
+        "upgrade_assets":       20.0,
+        "build_mine":           _csum(RESOURCE_COSTS["mine"]),
+        "build_port":           _csum(RESOURCE_COSTS["port"]),
+        "build_factory":        _csum(RESOURCE_COSTS["factory"]),
+        "build_power_plant":    _csum(RESOURCE_COSTS["power_plant"]),
+        "build_farm":           _csum(RESOURCE_COSTS["farm"]),
+        "build_base":           _csum(RESOURCE_COSTS["base"]),
+        "build_nuke_facility":  _csum(RESOURCE_COSTS["nuke_facility"]),
+        "build_orbital_defense": _csum(RESOURCE_COSTS["orbital_defense"]),
+        "build_division":       25.0,
+        "build_shipyard":       _csum(RESOURCE_COSTS["shipyard"]),
+        "build_fleet_ship_frigate":    _csum(SHIP_TEMPLATES["Frigate"].build_cost),
+        "build_fleet_ship_transport":  _csum(SHIP_TEMPLATES["Transport"].build_cost),
+        "build_fleet_ship_cruiser":    _csum(SHIP_TEMPLATES["Cruiser"].build_cost),
+        "build_fleet_ship_battleship": _csum(SHIP_TEMPLATES["Battleship"].build_cost),
+        "build_spaceport":      _csum(RESOURCE_COSTS["spaceport"]),
+        "build_lab":            _csum(RESOURCE_COSTS["lab"]),
+        "colonize_planet":      30.0,
+        "start_project":        50.0,
+    }
+    return w
+
+
+def _action_cost_weight(name: str) -> float:
+    global _ACTION_WEIGHTS
+    if not _ACTION_WEIGHTS:
+        try:
+            _ACTION_WEIGHTS = _build_action_weights()
+        except Exception:
+            _ACTION_WEIGHTS = {}
+    return _ACTION_WEIGHTS.get(name, _DEFAULT_ACTION_WEIGHT)
+
+
+def _overseer_priority(
+    ctrl: CivilianController, state: List[float], dept_valid: List[bool]
+) -> List[int]:
+    """Return valid department indices ordered by overseer preference.
+
+    The overseer scores all departments for *state*; valid departments are
+    returned highest-priority first.  Calling ``predict`` here also primes the
+    overseer's recurrent buffer with *state* so the subsequent ``train`` calls
+    operate on the correct context.  Falls back to natural order if the model
+    has no ``predict`` (defensive).
+    """
+    valid_idx = [i for i in range(len(DEPARTMENTS)) if dept_valid[i]]
+    predict = getattr(ctrl.overseer, "predict", None)
+    if predict is None:
+        return valid_idx
+    scores = predict(state)
+    valid_idx.sort(
+        key=lambda i: scores[i] if i < len(scores) else float("-inf"),
+        reverse=True,
+    )
+    return valid_idx
+
+
 def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) -> None:
-    """Two-level action selection: overseer picks department, dept model picks action."""
-    state = _civilian_state(nation)
+    """Priority-ordered civilian turn.
+
+    Departments do not take turns — each turn the *overseer* ranks them by
+    priority and every valid department then acts once in that order.  Because
+    each build checks resources, the high-priority departments spend first and
+    lower-priority ones get whatever is left (resource prioritisation rather
+    than a single winner).
+
+    Every department model **and** the overseer train each turn — the overseer
+    learns a per-department value (which shapes the priority order) and no
+    department is starved of training data the way single-routing did.
+    """
+    state0 = _civilian_state(nation)
 
     # A department is valid iff it has at least one currently valid action.
     dept_valid = [
         any(a.mask_fn(nation) for a in dept.actions)
         for dept in DEPARTMENTS
     ]
-    dept_local_idx = ctrl.overseer.choose_action(state, dept_valid)
-    dept = DEPARTMENTS[dept_local_idx]
+    if not any(dept_valid):
+        return
 
-    dept_model  = ctrl.dept_models[dept.slug]
-    local_valid = [a.mask_fn(nation) for a in dept.actions]
-    local_idx   = dept_model.choose_action(state, local_valid)
+    order = _overseer_priority(ctrl, state0, dept_valid)
 
-    global_idx = dept.actions[local_idx].idx
-    nation.last_civilian_action = global_idx
-    _execute_civilian_action(nation, global_idx)
+    # Soft per-turn budget: a nation only commits roughly what it can afford
+    # (net income + a slice of reserves).  High-priority departments spend
+    # first; once the budget is exhausted the rest stand down.  The top
+    # priority always gets to act so a poor nation is never fully paralysed.
+    budget = nation.civilian_action_budget() if hasattr(nation, "civilian_action_budget") else float("inf")
+    spent = 0.0
+
+    dept_rewards: Dict[int, float] = {}
+    first = True
+    for dept_idx in order:
+        dept       = DEPARTMENTS[dept_idx]
+        dept_model = ctrl.dept_models[dept.slug]
+        local_valid = [a.mask_fn(nation) for a in dept.actions]
+        if not any(local_valid):
+            continue
+
+        s         = _civilian_state(nation)
+        local_idx = dept_model.choose_action(s, local_valid)
+        action    = dept.actions[local_idx]
+        weight    = _action_cost_weight(action.name)
+        # Stop once the budget is spent — but always allow the first action.
+        if not first and spent + weight > budget:
+            break
+
+        global_idx = action.idx
+        if first:
+            nation.last_civilian_action = global_idx
+            first = False
+        _execute_civilian_action(nation, global_idx)
+        spent += weight
+
+        ns     = _civilian_state(nation)
+        reward = nation.compute_reward("civilian", s, ns)
+        dept_model.train(s, local_idx, reward, ns)
+        dept_rewards[dept_idx] = reward
+
+    # Train the overseer on every department it ranked this turn, using the
+    # reward that department's action actually produced.  This makes the
+    # overseer's per-department Q-values (and therefore the priority order)
+    # track which departments pay off in the current state.
+    if spent and hasattr(nation, "draw_civilian_budget"):
+        nation.draw_civilian_budget(spent)
 
     new_state = _civilian_state(nation)
-    reward    = nation.compute_reward("civilian", state, new_state)
-
-    ctrl.overseer.train(state, dept_local_idx, reward, new_state)
-    dept_model.train(state, local_idx, reward, new_state)
+    for dept_idx, reward in dept_rewards.items():
+        ctrl.overseer.train(state0, dept_idx, reward, new_state)
 
 
 def _apply_civilian_ai(nation: "Nation") -> None:

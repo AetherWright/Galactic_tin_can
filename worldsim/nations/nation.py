@@ -6,7 +6,7 @@ methods here delegate so call sites can stay ``nation.do_thing()``.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Set, List, Tuple, Optional, Any
+from typing import Dict, Set, List, Tuple, Optional, Any, ClassVar
 from pathlib import Path
 import random
 import math
@@ -115,6 +115,27 @@ from .civilian import (
     DEPARTMENTS,
     N_CIVILIAN_DEPARTMENTS,
 )
+
+
+def _iter_rnn_controllers(ctrl: Any):
+    """Yield every underlying torch RNN controller for *ctrl*.
+
+    A :class:`CivilianController` is hierarchical: it owns an overseer plus
+    one model per department.  Expanding it here lets meta-evolution reach
+    each per-nation LoRA, rather than skipping the wrapper entirely.  Any
+    non-torch (NelderMead) or ``None`` controller yields nothing.
+    """
+    try:
+        from ..ai.rnn import RNNController
+    except Exception:
+        return
+    if isinstance(ctrl, CivilianController):
+        candidates = (ctrl.overseer, *ctrl.dept_models.values())
+    else:
+        candidates = (ctrl,)
+    for c in candidates:
+        if isinstance(c, RNNController):
+            yield c
 
 
 
@@ -337,6 +358,55 @@ class Nation:
     def add_resource(self, kind: str, amount: float) -> None:
         self.econ.add_resource(kind, amount)
 
+    # ------------------------------------------------------------------
+    # Upkeep & civilian build budget
+    # ------------------------------------------------------------------
+    # Per-turn maintenance drawn against gross output, by asset class.  These
+    # are deliberately small: their job is to make net income (and therefore
+    # the civilian build budget) shrink as an empire grows, so expansion is
+    # self-limiting rather than to bankrupt nations.
+    _UPKEEP_BUILDING: ClassVar[float] = 0.5
+    _UPKEEP_DIVISION: ClassVar[float] = 1.0
+    _UPKEEP_SHIP:     ClassVar[float] = 1.5
+
+    def _building_count(self) -> int:
+        return (
+            len(self.cities) + len(self.bases) + len(self.mines) + len(self.farms)
+            + len(self.ports) + len(self.factories) + len(self.hospitals)
+            + len(self.shipyards) + len(self.spaceports) + len(self.schools)
+            + len(self.power_plants) + len(self.labs) + len(self.nuke_plants)
+            + len(self.orbital_defenses)
+        )
+
+    def compute_upkeep(self) -> float:
+        """Total per-turn upkeep for all of the nation's standing assets."""
+        return (
+            self._UPKEEP_BUILDING * self._building_count()
+            + self._UPKEEP_DIVISION * len(self.divisions)
+            + self._UPKEEP_SHIP * self._fleet_count()
+        )
+
+    def civilian_action_budget(self) -> float:
+        """Soft per-turn budget the civilian AI may spend on construction.
+
+        Net income plus a slice of the treasury (see
+        :meth:`Economy.civilian_budget`).  ``settle_turn`` must have run for
+        the current turn first (it does, in :meth:`process_turn`).
+        """
+        return self.econ.civilian_budget()
+
+    def draw_civilian_budget(self, amount: float) -> None:
+        """Deduct committed civilian construction spend from the treasury."""
+        self.econ.draw_reserve(amount)
+
+    @property
+    def reserves(self) -> float:
+        return self.econ.reserves
+
+    @property
+    def last_net_income(self) -> float:
+        return self.econ.last_net_income
+
     def dominant_idea(self) -> str | None:
         """Return the most prevalent idea across the nation."""
         totals: Dict[str, int] = {}
@@ -442,16 +512,18 @@ class Nation:
         # weighting.  Silent failure when torch is absent or controllers
         # are the legacy NelderMead type.
         try:
-            from ..ai.rnn import RNNController
             _CTRL_ATTRS = (
                 "civilian_ai", "military_ai", "project_ai",
                 "diplomacy_ai", "research_ai", "doctrine_ai",
             )
             for attr in _CTRL_ATTRS:
                 ctrl = getattr(self, attr, None)
-                if isinstance(ctrl, RNNController):
-                    ctrl.mutate_lora(sigma=0.02)
-                    ctrl.reset_lora_optimizer()
+                # The civilian AI is a hierarchical CivilianController wrapping
+                # an overseer plus one model per department; expand it so each
+                # underlying RNN controller is evolved.
+                for sub in _iter_rnn_controllers(ctrl):
+                    sub.mutate_lora(sigma=0.02)
+                    sub.reset_lora_optimizer()
         except Exception:
             pass
 
@@ -666,6 +738,10 @@ class Nation:
         if "economy" in gov_bonuses:
             econ_mult *= gov_bonuses["economy"]
         self.economy_linear = total_econ * (1 + port_bonus) * econ_mult + trade_bonus
+
+        # Bank net income (gross output minus upkeep) into the treasury so the
+        # civilian AI has a soft per-turn construction budget to spend against.
+        self.econ.settle_turn(self.economy_linear, self.compute_upkeep())
 
         self.tech_tree.research(
             self.economy * 0.05 + research_bonus,

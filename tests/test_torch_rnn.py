@@ -694,6 +694,39 @@ class TestRoleWrappers:
         ai.set_allies_dimension(4)  # same dim — no-op
         assert ai.n_inputs == n_before
 
+    def test_torch_war_ai_set_allies_dimension_rebuilds_target(self):
+        """After a dimension change the frozen target tensors must match the
+        new input size, otherwise the next Double-DQN train pass raises."""
+        ai = TorchWarAI(allies_dim=4)
+        ai.set_allies_dimension(9)
+        assert ai._target_A_in.shape[1] == ai.n_inputs
+        assert ai.lora_A_in.shape[1] == ai.n_inputs
+        # Train past TARGET_UPDATE_FREQ so _update_target_network runs too.
+        s = rand_state(ai.n_inputs)
+        for _ in range(ai.TARGET_UPDATE_FREQ * 2):
+            a = ai.choose_action(s)
+            ai.train(s, a, 0.5, s)   # must not raise
+
+    def test_torch_war_ai_save_reload_after_dimension_change(self, tmp_path):
+        """A war controller that changed dimension mid-run must save and
+        reload cleanly into a freshly-constructed (default-size) controller."""
+        war = TorchWarAI(table_path=tmp_path / "nation_0_military.yml", allies_dim=4)
+        war.set_allies_dimension(9)            # live nation count grew
+        s = rand_state(war.n_inputs)
+        for _ in range(20):
+            war.train(s, war.choose_action(s), 0.5, s)
+        saved = war.lora_A_in.data.clone()
+        war.save_table(tmp_path / "nation_0_military.yml")
+
+        # Fresh controller at the DEFAULT dimension reloads the larger weights.
+        war2 = TorchWarAI(table_path=tmp_path / "nation_0_military.yml", allies_dim=4)
+        assert war2.n_inputs == war.n_inputs
+        assert war2.allies_dim == 9
+        assert torch.allclose(war2.lora_A_in.data, saved)
+        # And it can keep training after the reload.
+        s2 = rand_state(war2.n_inputs)
+        war2.train(s2, 0, 1.0, s2)
+
     # ----- TorchDomesticPolicyAI -----
     def test_domestic_policy_ai_output_dim(self):
         ai = TorchDomesticPolicyAI(actions=21, n_inputs=20)

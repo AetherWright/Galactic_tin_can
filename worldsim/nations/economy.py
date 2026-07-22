@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import ClassVar, Dict
 import math
 
 
@@ -18,9 +18,24 @@ class Economy:
     caps:
         Maximum storage capacity for each resource. Growth slows as a
         stockpile approaches its cap to avoid abrupt overflow.
+    reserves:
+        Accumulated treasury (linear).  Each turn's net income is banked here
+        and it is drawn down by civilian construction via the soft action
+        budget.  Capped relative to gross output so it can't grow unbounded.
+    last_net_income:
+        Net income (gross output minus upkeep) computed on the most recent
+        settled turn.  Feeds the per-turn civilian build budget.
     """
 
+    # How much of the standing reserve a nation is willing to commit to civilian
+    # construction in a single turn, on top of the turn's net income.
+    _RESERVE_DRAW:     ClassVar[float] = 0.34
+    # Treasury ceiling, as a multiple of the turn's gross output.
+    _RESERVE_CAP_MULT: ClassVar[float] = 5.0
+
     funds: float = 100.0
+    reserves: float = 0.0
+    last_net_income: float = 0.0
     resources: Dict[str, float] = field(
         default_factory=lambda: {
             "food": 100.0,
@@ -74,6 +89,36 @@ class Economy:
         spent = min(actual, amount)
         self.set_linear_funds(actual - spent)
         return spent
+
+    # Treasury / budget ------------------------------------------------
+    def settle_turn(self, gross_output: float, upkeep: float) -> float:
+        """Bank this turn's net income into the reserve and record it.
+
+        ``net = gross_output - upkeep`` (upkeep floored at 0).  The net is
+        added to :attr:`reserves` (which is floored at 0 and capped relative
+        to gross output so the treasury can't grow without bound).  Returns
+        the net income for the turn.
+        """
+        net = float(gross_output) - max(0.0, float(upkeep))
+        self.last_net_income = net
+        self.reserves = max(0.0, self.reserves + net)
+        cap = self._RESERVE_CAP_MULT * max(float(gross_output), 1.0)
+        if self.reserves > cap:
+            self.reserves = cap
+        return net
+
+    def civilian_budget(self) -> float:
+        """Spendable civilian-construction budget for the current turn.
+
+        The turn's net income plus a fixed fraction of the standing reserve —
+        a nation spends roughly what it earns, dipping into savings for a
+        bigger building push when it has them.
+        """
+        return max(0.0, self.last_net_income) + self._RESERVE_DRAW * max(0.0, self.reserves)
+
+    def draw_reserve(self, amount: float) -> None:
+        """Deduct *amount* of committed construction spend from the reserve."""
+        self.reserves = max(0.0, self.reserves - max(0.0, float(amount)))
 
     def has_resources(self, cost: Dict[str, float]) -> bool:
         return all(self.resources.get(k, 0.0) >= v for k, v in cost.items())

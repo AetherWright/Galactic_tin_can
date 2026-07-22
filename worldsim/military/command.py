@@ -2,8 +2,8 @@
 
 FleetFSM
     Each fleet holds a lightweight neural controller
-    (:class:`LayeredNetworkFleetController`, or the Torch MLP from
-    :mod:`worldsim.ai.torch_fleet` when PyTorch is available).  Every fifth
+    (:class:`LayeredNetworkFleetController`, or the GRU+LoRA Torch controller
+    from :mod:`worldsim.ai.rnn` when PyTorch is available).  Every fifth
     ``fsm_transition`` is called:
 
     1. Build a 15-feature context vector for the fleet.
@@ -221,11 +221,12 @@ class LayeredNetworkFleetController:
 def make_fleet_controller() -> LayeredNetworkFleetController:
     """Return the best available fleet controller.
 
-    Prefers the Torch fleet controller from :mod:`worldsim.ai.torch_fleet` when PyTorch is
-    importable; otherwise returns :class:`LayeredNetworkFleetController`.
+    Prefers the GRU+LoRA Torch fleet controller from :mod:`worldsim.ai.rnn`
+    when PyTorch is importable; otherwise returns
+    :class:`LayeredNetworkFleetController`.
     """
     try:
-        from ..ai.torch_fleet import TorchFleetController
+        from ..ai.rnn import TorchFleetController
         if TorchFleetController is not None:
             return TorchFleetController()  # type: ignore[return-value]
     except (ImportError, AttributeError):

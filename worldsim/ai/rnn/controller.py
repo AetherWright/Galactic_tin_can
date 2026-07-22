@@ -95,6 +95,11 @@ class RNNController:
     _FITNESS_SCALE:     float = 80.0
     # Floor on epsilon even for very high-fitness genomes
     _EPSILON_FLOOR:     float = 0.02
+    # Dynamic LoRA learning-rate warmup (only active when dynamic_lr=True):
+    # a fresh controller starts at (1 + BOOST)×base lr and decays back to base
+    # over ~WARMUP_STEPS train calls, so freshly-seeded models learn rapidly.
+    _LR_WARMUP_BOOST:   float = 4.0
+    _LR_WARMUP_STEPS:   float = 100.0
 
     def __init__(
         self,
@@ -109,6 +114,7 @@ class RNNController:
         gamma:      float = _GAMMA,
         lr_lora:    float = _LR_LORA,
         seed:       Optional[int] = None,
+        dynamic_lr: bool  = False,
     ) -> None:
         self.role       = role
         self.n_inputs   = n_inputs
@@ -142,6 +148,7 @@ class RNNController:
             lr=lr_lora,
         )
         self._lr_lora = lr_lora
+        self._dynamic_lr = dynamic_lr
 
         # Double DQN target network — frozen copies of online LoRA
         with torch.no_grad():
@@ -365,7 +372,14 @@ class RNNController:
             target[0, action] = target_val
             loss = F.mse_loss(cur_scores, target)
 
-            # Update LoRA
+            # Update LoRA (with optional fresh-start learning-rate warmup)
+            if self._dynamic_lr:
+                warm = self._lr_lora * (
+                    1.0 + self._LR_WARMUP_BOOST
+                    * math.exp(-self._train_steps / self._LR_WARMUP_STEPS)
+                )
+                for g in self._lora_optimizer.param_groups:
+                    g["lr"] = warm
             self._lora_optimizer.zero_grad()
             loss.backward()
             self._lora_optimizer.step()
@@ -480,18 +494,53 @@ class RNNController:
         if not path.exists():
             return
         sd = torch.load(path, map_location=_DEVICE, weights_only=True)
-        if "lora_A_in"    in sd: self.lora_A_in.data.copy_(sd["lora_A_in"])
-        if "lora_B_in"    in sd: self.lora_B_in.data.copy_(sd["lora_B_in"])
-        if "lora_A_out"   in sd: self.lora_A_out.data.copy_(sd["lora_A_out"])
-        if "lora_B_out"   in sd: self.lora_B_out.data.copy_(sd["lora_B_out"])
-        if "target_A_in"  in sd: self._target_A_in.copy_(sd["target_A_in"])
-        if "target_B_in"  in sd: self._target_B_in.copy_(sd["target_B_in"])
-        if "target_A_out" in sd: self._target_A_out.copy_(sd["target_A_out"])
-        if "target_B_out" in sd: self._target_B_out.copy_(sd["target_B_out"])
+
+        # Restore the online LoRA parameters.  The war controller's input
+        # dimension tracks the live nation count, so a checkpoint may have
+        # been written at a different size than the freshly-constructed
+        # controller.  When the saved shape differs we rebuild the parameter
+        # rather than calling ``copy_`` (which would raise on a size mismatch).
+        shape_changed = False
+        for name in ("lora_A_in", "lora_B_in", "lora_A_out", "lora_B_out"):
+            if name not in sd:
+                continue
+            saved = sd[name].to(_DEVICE)
+            param = getattr(self, name)
+            if tuple(param.shape) != tuple(saved.shape):
+                setattr(self, name, nn.Parameter(saved.clone()))
+                shape_changed = True
+            else:
+                param.data.copy_(saved)
+
+        # The frozen target tensors are plain tensors saved alongside the
+        # online weights; assign clones so any shape change is absorbed.
+        for tname, key in (
+            ("_target_A_in",  "target_A_in"),
+            ("_target_B_in",  "target_B_in"),
+            ("_target_A_out", "target_A_out"),
+            ("_target_B_out", "target_B_out"),
+        ):
+            if key in sd:
+                setattr(self, tname, sd[key].to(_DEVICE).clone())
+
         if "h"            in sd: self._h = sd["h"]
         if "train_steps"  in sd: self._train_steps  = int(sd["train_steps"])
         if "reward_scale" in sd: self._reward_scale = float(sd["reward_scale"])
         if "genome_id"    in sd: self._genome_id    = int(sd["genome_id"])
+
+        if shape_changed:
+            # Input/output dimensions are implied by the LoRA shapes.  Realign
+            # the controller (shared base model, optimizer, rolling buffer) so
+            # subsequent forward/training passes use consistent shapes.
+            self.n_inputs  = self.lora_A_in.shape[1]
+            self.n_outputs = self.lora_B_out.shape[0]
+            self.base = get_role_model(
+                self.role, self.n_inputs, self.hidden_dim, self.n_outputs
+            )
+            self.reset_lora_optimizer()
+            self._buffer = deque(
+                [[0.0] * self.n_inputs] * BUFFER_SIZE, maxlen=BUFFER_SIZE
+            )
 
 # -----------------------------------------------------------------------
 # Base class adding save_table / load_table compatibility shims
@@ -514,10 +563,11 @@ class _RoleController(RNNController):
         epsilon:    float,
         gamma:      float,
         seed:       Optional[int] = None,
+        dynamic_lr: bool = False,
     ) -> None:
         super().__init__(
             role, n_inputs, n_outputs, hidden_dim,
-            epsilon=epsilon, gamma=gamma, seed=seed,
+            epsilon=epsilon, gamma=gamma, seed=seed, dynamic_lr=dynamic_lr,
         )
         self.table_path = Path(table_path) if table_path else None
         if self.table_path:
