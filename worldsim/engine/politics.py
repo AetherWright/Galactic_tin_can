@@ -29,9 +29,6 @@ def _spawn_rebel_nation(parent: Nation, nations: Dict[int, Nation], year: int) -
     nations[new_id] = rebel
     rebel.year_born = year
     rebel.last_collapse = year
-    for key, ga in parent.reward_ga.items():
-        rebel.reward_ga[key] = ga.clone()
-        rebel.reward_ga[key].mutate(0.15)
 
     for other in nations.values():
         if other.id == new_id:
@@ -125,9 +122,6 @@ def _handle_internal_conflicts(nations: Dict[int, Nation], year: int) -> None:
         )
         new_nation.year_born = year
         new_nation.last_collapse = year
-        new_nation.reward_ga = {k: ga.clone() for k, ga in old.reward_ga.items()}
-        for ga in new_nation.reward_ga.values():
-            ga.mutate(0.05)
         nations[nid] = new_nation
         assign_initial_cities({nid: new_nation})
 

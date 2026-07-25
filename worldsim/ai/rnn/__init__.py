@@ -45,6 +45,44 @@ Public API (matches the NelderMeadPolicy surface)
 The package imports cleanly when PyTorch is missing: every public name is
 then bound to ``None`` (classes) or a no-op (functions) and
 :func:`rnn_available` returns ``False``.
+
+Categorical (C51) events role
+    :mod:`.categorical` adds one further role, ``"events"``
+    (:class:`TorchEventAI`), sharing the same registry and per-nation LoRA
+    mechanism above but with a *categorical distributional* value head
+    (Bellemare et al. 2017 "C51") instead of scalar Double DQN — this is
+    what replaced the old per-event-name Q-table
+    (:class:`worldsim.events.qlearner.EventQLearner`) with one shared model
+    that generalises across every event.
+
+Design note — future unified all-directorate model (not implemented yet)
+    Every role above (war, civilian, project, diplomacy, research, doctrine,
+    fleet, events) still owns its *own* shared trunk (:class:`RoleBaseModel`
+    / :class:`~.categorical.CategoricalRoleBaseModel`), keyed by role name.
+    The next phase (deferred — not part of this change) is to collapse those
+    trunks into a *single* shared backbone across every directorate:
+
+    * One GRU trunk, same as today, but its input is a **canonical** nation-
+      state feature vector plus a small learned "directorate" embedding
+      identifying which role is calling — instead of a per-role trunk with a
+      per-role input shape.
+    * Per-directorate output heads (small linear layers sized to each
+      directorate's existing action count) sit on top of the shared latent,
+      replacing each role's dedicated ``output_proj``.
+    * Per-nation LoRA stays exactly as it is today, applied to the shared
+      trunk's input/output projections — the mechanism itself doesn't
+      change, only how many trunks it's attached to.
+    * This is what makes one designed reward function
+      (:meth:`worldsim.nations.nation.Nation.compute_reward`, fed by
+      :meth:`~worldsim.nations.nation.Nation.reward_snapshot`) sufficient for
+      every directorate: the reward no longer depends on a per-role,
+      differently-shaped observation vector, so a single trunk with multiple
+      heads doesn't need per-head reward logic either.
+
+    The 7 existing per-role base models are left as-is until that migration
+    is scheduled; this phase only unifies the *reward function* (see
+    ``Nation.compute_reward``) and collapses the *events* Q-learning into one
+    categorical agent, both of which this unified model will build on.
 """
 from __future__ import annotations
 
@@ -76,12 +114,16 @@ if _TORCH_AVAILABLE:
         _FLEET_STATE_LIST,
         _REGISTRY,
         _REGISTRY_LOCK,
-        _ROLE_GA_KEY,
         get_role_model,
         load_all_base_models,
         save_all_base_models,
         step_all_base_models,
-        sync_all_meta_ga,
+    )
+    from .categorical import (
+        CategoricalRNNController,
+        CategoricalRoleBaseModel,
+        N_ATOMS,
+        get_categorical_role_model,
     )
     from .controller import RNNController
     from .roles import (
@@ -90,6 +132,7 @@ if _TORCH_AVAILABLE:
         TorchDiplomacyAI,
         TorchDoctrineAI,
         TorchDomesticPolicyAI,
+        TorchEventAI,
         TorchFleetController,
         TorchProjectAI,
         TorchResearchAI,
@@ -99,8 +142,10 @@ else:
     # -----------------------------------------------------------------------
     # Stubs — imported safely when torch is absent
     # -----------------------------------------------------------------------
-    RNNController          = None   # type: ignore[assignment,misc]
-    RoleBaseModel          = None   # type: ignore[assignment,misc]
+    RNNController              = None   # type: ignore[assignment,misc]
+    RoleBaseModel              = None   # type: ignore[assignment,misc]
+    CategoricalRNNController   = None   # type: ignore[assignment,misc]
+    CategoricalRoleBaseModel   = None   # type: ignore[assignment,misc]
     TorchWarAI             = None   # type: ignore[assignment,misc]
     TorchDomesticPolicyAI  = None   # type: ignore[assignment,misc]
     TorchCivilianOverseer  = None   # type: ignore[assignment,misc]
@@ -110,14 +155,15 @@ else:
     TorchResearchAI        = None   # type: ignore[assignment,misc]
     TorchDoctrineAI        = None   # type: ignore[assignment,misc]
     TorchFleetController   = None   # type: ignore[assignment,misc]
+    TorchEventAI           = None   # type: ignore[assignment,misc]
 
     def get_role_model(*_a: object, **_kw: object) -> None:   # type: ignore[return]
         return None
 
-    def step_all_base_models(*_a: object, **_kw: object) -> None:
-        pass
+    def get_categorical_role_model(*_a: object, **_kw: object) -> None:   # type: ignore[return]
+        return None
 
-    def sync_all_meta_ga(*_a: object, **_kw: object) -> None:
+    def step_all_base_models(*_a: object, **_kw: object) -> None:
         pass
 
     def save_all_base_models(*_a: object, **_kw: object) -> None:

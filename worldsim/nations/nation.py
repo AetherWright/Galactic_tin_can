@@ -15,7 +15,6 @@ from ..ai import (
     DomesticPolicyAI, ProjectAI, DiplomacyAI, ResearchAI, WarAI,
     CivilianOverseerAI, DepartmentPolicyAI,
 )
-from ..ai.meta_ga import RewardGA
 from ..diplomacy import (
     Message,
     can_communicate,
@@ -123,18 +122,21 @@ def _iter_rnn_controllers(ctrl: Any):
     A :class:`CivilianController` is hierarchical: it owns an overseer plus
     one model per department.  Expanding it here lets meta-evolution reach
     each per-nation LoRA, rather than skipping the wrapper entirely.  Any
-    non-torch (NelderMead) or ``None`` controller yields nothing.
+    non-torch (NelderMead / :class:`~worldsim.events.qlearner.EventQLearner`)
+    or ``None`` controller yields nothing.
     """
     try:
-        from ..ai.rnn import RNNController
+        from ..ai.rnn import CategoricalRNNController, RNNController
     except Exception:
+        return
+    if ctrl is None:
         return
     if isinstance(ctrl, CivilianController):
         candidates = (ctrl.overseer, *ctrl.dept_models.values())
     else:
         candidates = (ctrl,)
     for c in candidates:
-        if isinstance(c, RNNController):
+        if isinstance(c, (RNNController, CategoricalRNNController)):
             yield c
 
 
@@ -210,9 +212,12 @@ class Nation:
     project_ai: Optional[ProjectAI] = field(default=None)
     diplomacy_ai: Optional[DiplomacyAI] = field(default=None)
     research_ai: Optional[ResearchAI] = field(default=None)
+    # Shared categorical (C51) event Q-learning agent, LoRA-specialised per
+    # nation — ``None`` when torch is unavailable, in which case
+    # ``EventDecisionEngine`` falls back to its own tabular ``EventQLearner``.
+    events_ai: Optional[Any] = field(default=None)
     action_queue: List[int] = field(default_factory=list)
     inbox: List[Message] = field(default_factory=list)
-    reward_ga: Dict[str, RewardGA] = field(default_factory=dict)
     leader_model: LeaderModel = field(default_factory=LeaderModel)
     leader: Leader = field(init=False)
     goals: GoalManager = field(default_factory=GoalManager)
@@ -242,6 +247,7 @@ class Nation:
         diplomacy_path = self._ai_table_path("diplomacy")
         research_path  = self._ai_table_path("research")
         doctrine_path  = self._ai_table_path("doctrine")
+        events_path    = self._ai_table_path("events")
 
         # Prefer the PyTorch RNN backend when available; fall back to the
         # hand-rolled Nelder-Mead controllers otherwise.
@@ -255,6 +261,7 @@ class Nation:
                 TorchDiplomacyAI,
                 TorchResearchAI,
                 TorchDoctrineAI,
+                TorchEventAI,
             )
             _use_torch = rnn_available()
         except Exception:  # ImportError or anything else
@@ -286,6 +293,7 @@ class Nation:
                 len(self.tech_tree.nodes), n_inputs=4, table_path=research_path
             )
             self.doctrine_ai  = TorchDoctrineAI(table_path=doctrine_path)
+            self.events_ai    = TorchEventAI(table_path=events_path)
         else:
             self.military_ai  = WarAI(allies_dim=ally_dim, table_path=military_path)
             self.civilian_ai  = CivilianController(
@@ -434,13 +442,6 @@ class Nation:
         self.doctrine = self.military_ai.create_doctrine()
         if self.doctrine not in self.available_doctrines:
             self.available_doctrines.append(self.doctrine)
-        self.reward_ga = {
-            "research": RewardGA(4),
-            "projects": RewardGA(6),
-            "civilian": RewardGA(6),
-            "diplomacy": RewardGA(5),
-            "events": RewardGA(5),
-        }
         self.goals.spawn_goals(self, 2)
         self.leader = self.leader_model.generate(self)
         self._update_centroids()
@@ -468,28 +469,62 @@ class Nation:
         self.world_centroid = (xs / n, ys / n, zs / n)
         self._centroid_updated_this_turn = True
 
-    def compute_reward(
-        self, task: str, state: List[float], new_state: List[float]
-    ) -> float:
-        """Return weighted reward for *task* based on meta-learning.
+    # Fixed weighting applied to a :meth:`reward_snapshot` delta by
+    # :meth:`compute_reward` — hand-designed once, shared by every
+    # directorate (research/projects/civilian/diplomacy/events), rather than
+    # a separately GA-evolved vector per directorate.  Relative emphasis
+    # mirrors ``engine.scoring.century_score``: stability weighted heaviest,
+    # star/fleet counts next (they change rarely, so a unit change should
+    # matter a lot), economy/military/technology moderate, population scaled
+    # down since its deltas run into the thousands.
+    _REWARD_WEIGHTS: ClassVar[Tuple[float, ...]] = (
+        0.05,    # economy (log-scaled)
+        1.0,     # stability
+        0.1,     # military
+        0.3,     # technology.overall
+        0.1,     # infrastructure
+        0.0005,  # population
+        5.0,     # star_count
+        2.0,     # fleet count
+    )
 
-        The raw reward is the dot product of the active MetaGA genome's
-        weight vector with the per-feature state delta.  A small goal-
-        progress bonus is added on top so the RL signal explicitly rewards
-        progress toward the nation's current objectives, tightening the
-        feedback loop between the GA-level goal setting and the RL policy.
+    def reward_snapshot(self) -> List[float]:
+        """Fixed-order outcome vector consumed by :meth:`compute_reward`.
+
+        Independent of any directorate's own observation-vector shape —
+        every call site captures this before and after acting so
+        :meth:`compute_reward` can apply one designed weighting identically
+        for every directorate, rather than each directorate reading its own
+        differently-shaped state vector.
+
+        Uses the log-scaled ``economy`` (not ``economy_linear``, which is
+        unbounded/exponential) — matching every existing observation vector
+        (``_civilian_state``, ``EventDecisionEngine._state_snapshot``,
+        ``century_score``) so a single wealthy nation can't produce a reward
+        spike large enough to destabilise training.
         """
-        diff = [n - s for n, s in zip(new_state, state)]
-        ga = self.reward_ga.get(task)
-        if ga:
-            weights = ga.weights
-            if len(weights) < len(diff):
-                weights = weights + [1.0] * (len(diff) - len(weights))
-            base_reward = sum(w * d for w, d in zip(weights, diff))
-        else:
-            base_reward = sum(diff)
+        return [
+            self.economy,
+            self.stability,
+            self.military,
+            self.technology.overall,
+            self.infrastructure,
+            float(self.population),
+            float(self.star_count),
+            self._fleet_count(),
+        ]
 
-        # Goal-progress bonus: nudge the policy toward active objectives.
+    def compute_reward(self, before: List[float], after: List[float]) -> float:
+        """Return the reward for a *before* → *after* :meth:`reward_snapshot` pair.
+
+        One fixed, hand-designed weighting (:attr:`_REWARD_WEIGHTS`) shared
+        by every directorate, plus a small goal-progress bonus so the RL
+        signal explicitly rewards progress toward the nation's current
+        objectives.
+        """
+        diff = [a - b for a, b in zip(after, before)]
+        base_reward = sum(w * d for w, d in zip(self._REWARD_WEIGHTS, diff))
+
         # progress() is O(1) per goal (pure arithmetic on nation attributes).
         goal_bonus = sum(
             g.progress(self) * g.priority for g in self.goals.active()
@@ -502,19 +537,16 @@ class Nation:
         self.leader_model.step()
 
     def evolve_meta(self) -> None:
-        for ga in self.reward_ga.values():
-            ga.evolve()
         self.leader_model.evolve()
         self.leader = self.leader_model.generate(self)
         self.last_collapse = self.current_year
         # Mutate LoRA + reset optimizers for every RNN controller so the
-        # behaviour space is explored alongside the new genome's reward
-        # weighting.  Silent failure when torch is absent or controllers
-        # are the legacy NelderMead type.
+        # behaviour space is explored on collapse/rebirth.  Silent failure
+        # when torch is absent or controllers are the legacy NelderMead type.
         try:
             _CTRL_ATTRS = (
                 "civilian_ai", "military_ai", "project_ai",
-                "diplomacy_ai", "research_ai", "doctrine_ai",
+                "diplomacy_ai", "research_ai", "doctrine_ai", "events_ai",
             )
             for attr in _CTRL_ATTRS:
                 ctrl = getattr(self, attr, None)

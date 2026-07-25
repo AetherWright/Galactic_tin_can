@@ -48,7 +48,6 @@ from worldsim.ai.rnn import (
     save_all_base_models,
     load_all_base_models,
     step_all_base_models,
-    sync_all_meta_ga,
     TorchWarAI,
     TorchDomesticPolicyAI,
     TorchProjectAI,
@@ -59,7 +58,6 @@ from worldsim.ai.rnn import (
     _REGISTRY,
     _REGISTRY_LOCK,
 )
-from worldsim.ai.meta_ga import RewardGA
 
 # ---------------------------------------------------------------------------
 # Constants used across tests
@@ -1012,98 +1010,10 @@ class TestDoubleDQN:
 
 
 # ===========================================================================
-# 16. MetaGA integration
+# 16. LoRA exploration (mutate_lora / reset_lora_optimizer)
 # ===========================================================================
 
-def _make_ga(length: int = 6, fitness: float = 0.0) -> RewardGA:
-    """Helper: return a RewardGA with a known active genome fitness."""
-    ga = RewardGA(length, population=4)
-    ga.population[ga.active].fitness = fitness
-    return ga
-
-
-class TestMetaGAIntegration:
-    def test_sync_positive_fitness_reduces_epsilon(self):
-        ctrl = fresh_controller(epsilon=0.10)
-        ga   = _make_ga(fitness=160.0)   # 2 × FITNESS_SCALE → epsilon ≈ 0.10 · e^{-2}
-        ctrl.sync_meta_ga(ga)
-        assert ctrl.epsilon < 0.10, f"epsilon did not decrease: {ctrl.epsilon}"
-        assert ctrl.epsilon >= RNNController._EPSILON_FLOOR
-
-    def test_sync_zero_fitness_keeps_base_epsilon(self):
-        ctrl = fresh_controller(epsilon=0.10)
-        ga   = _make_ga(fitness=0.0)
-        ctrl.sync_meta_ga(ga)
-        # exp(-0) = 1 → epsilon == base_epsilon
-        assert abs(ctrl.epsilon - 0.10) < 1e-6
-
-    def test_sync_negative_fitness_raises_epsilon_toward_base(self):
-        """Negative fitness must not drive epsilon below floor."""
-        ctrl = fresh_controller(epsilon=0.10)
-        ga   = _make_ga(fitness=-200.0)
-        ctrl.sync_meta_ga(ga)
-        # max(0, -200)/80 = 0 → epsilon stays at base (no amplification above 1.0)
-        assert ctrl.epsilon == pytest.approx(0.10, abs=1e-6)
-
-    def test_sync_positive_fitness_increases_reward_scale(self):
-        ctrl = fresh_controller()
-        ga   = _make_ga(fitness=200.0)   # scale = 1 + 200/200 = 2.0
-        ctrl.sync_meta_ga(ga)
-        assert ctrl._reward_scale > 1.0
-
-    def test_sync_negative_fitness_decreases_reward_scale(self):
-        ctrl = fresh_controller()
-        ga   = _make_ga(fitness=-200.0)  # scale = max(0.5, 1 - 1.0) = 0.5
-        ctrl.sync_meta_ga(ga)
-        assert ctrl._reward_scale < 1.0
-        assert ctrl._reward_scale >= 0.5
-
-    def test_reward_scale_clamped_at_max(self):
-        ctrl = fresh_controller()
-        ga   = _make_ga(fitness=10_000.0)
-        ctrl.sync_meta_ga(ga)
-        assert ctrl._reward_scale <= 2.0
-
-    def test_genome_change_resets_optimizer(self):
-        """Switching the active genome must trigger optimizer reset."""
-        ctrl = fresh_controller()
-        ga   = _make_ga()
-        ctrl.sync_meta_ga(ga)           # genome 0 → _genome_id = 0
-
-        # Train a few steps so Adam accumulates momentum
-        s = rand_state()
-        ctrl.choose_action(s)
-        ctrl.train(s, 0, 1.0, rand_state())
-
-        old_opt_id = id(ctrl._lora_optimizer)
-
-        # Change active genome
-        ga.active = 1
-        ctrl.sync_meta_ga(ga)           # genome 1 → should reset optimizer
-
-        assert id(ctrl._lora_optimizer) != old_opt_id, (
-            "Optimizer not replaced after genome change"
-        )
-
-    def test_same_genome_no_optimizer_reset(self):
-        """Syncing the same genome twice must NOT reset the optimizer."""
-        ctrl = fresh_controller()
-        ga   = _make_ga()
-        ctrl.sync_meta_ga(ga)
-        old_opt_id = id(ctrl._lora_optimizer)
-        ctrl.sync_meta_ga(ga)   # same genome
-        assert id(ctrl._lora_optimizer) == old_opt_id
-
-    def test_reward_scaling_applied_in_train(self):
-        """With _reward_scale > 1 the replay stores a larger reward value."""
-        ctrl = fresh_controller()
-        ctrl._reward_scale = 2.0
-        s = rand_state()
-        ctrl.choose_action(s)
-        ctrl.train(s, 0, 1.0, rand_state())   # reward 1.0 → stored as 2.0
-        _, _, stored_reward, _ = ctrl.base._replay[-1]
-        assert abs(stored_reward - 2.0) < 1e-5
-
+class TestLoRAExploration:
     def test_mutate_lora_changes_all_params(self):
         ctrl   = fresh_controller()
         before = {
@@ -1140,36 +1050,6 @@ class TestMetaGAIntegration:
         ctrl.train(s, 0, 1.0, rand_state())
         ctrl.reset_lora_optimizer()
         assert len(ctrl._lora_optimizer.state) == 0
-
-
-# ===========================================================================
-# 17. sync_all_meta_ga
-# ===========================================================================
-
-class TestSyncAllMetaGA:
-    def test_sync_all_meta_ga_no_crash(self):
-        """sync_all_meta_ga must not raise even when no torch controllers exist."""
-        sync_all_meta_ga({})   # empty nations dict
-
-    def test_sync_all_meta_ga_updates_epsilon(self):
-        """Running sync with high fitness should lower epsilon on all controllers."""
-        # Build a minimal fake 'nations' dict with one nation-like object
-        from types import SimpleNamespace
-        ga = _make_ga(fitness=200.0)
-        ctrl = fresh_controller(epsilon=0.10)
-        nation = SimpleNamespace(
-            civilian_ai=ctrl,
-            project_ai=None,
-            diplomacy_ai=None,
-            research_ai=None,
-            military_ai=None,
-            doctrine_ai=None,
-            reward_ga={"civilian": ga, "projects": _make_ga(), "diplomacy": _make_ga(),
-                       "research": _make_ga(), "events": _make_ga()},
-        )
-        nations = {0: nation}
-        sync_all_meta_ga(nations)
-        assert ctrl.epsilon < 0.10
 
 
 class TestEdgeCases:

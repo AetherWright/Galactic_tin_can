@@ -37,18 +37,6 @@ _FLEET_STATE_LIST: List[str] = [
     "patrol", "assault", "defend", "escort", "retreat", "reposition", "colonize"
 ]
 
-# Role → per-nation RewardGA key.  Fleet and doctrine use the civilian GA
-# as a proxy because they have no dedicated reward tracker.
-_ROLE_GA_KEY: dict = {
-    "civilian":  "civilian",
-    "project":   "projects",
-    "diplomacy": "diplomacy",
-    "research":  "research",
-    "war":       "civilian",   # proxy
-    "doctrine":  "civilian",   # proxy
-    "fleet":     "civilian",   # proxy
-}
-
 
 # -----------------------------------------------------------------------
 # Shared GRU backbone
@@ -240,36 +228,6 @@ def step_all_base_models(n_steps: int = 4) -> None:
     """
     for model in list(_REGISTRY.values()):
         model.update_base(n_steps=n_steps)
-
-
-def sync_all_meta_ga(nations: object) -> None:
-    """Push MetaGA fitness state into every nation's RNN controllers.
-
-    Call this from the simulation's century loop *after*
-    ``ga.step(score)`` has been called for all nations and *before* the
-    per-fifth simulation steps begin.
-
-    For each nation the appropriate :class:`~worldsim.meta_ga.RewardGA`
-    instance (keyed by :data:`_ROLE_GA_KEY`) is passed to the
-    controller's :meth:`~RNNController.sync_meta_ga` method so that
-    epsilon and reward-scale reflect the current genome's fitness.
-    """
-    _attr_role_ga: list = [
-        ("civilian_ai",  "civilian"),
-        ("project_ai",   "projects"),
-        ("diplomacy_ai", "diplomacy"),
-        ("research_ai",  "research"),
-        ("military_ai",  "civilian"),   # proxy
-        ("doctrine_ai",  "civilian"),   # proxy
-    ]
-    for nation in nations.values():                          # type: ignore[attr-defined]
-        for attr, ga_key in _attr_role_ga:
-            ctrl = getattr(nation, attr, None)
-            if not hasattr(ctrl, "sync_meta_ga"):
-                continue
-            ga = nation.reward_ga.get(ga_key)               # type: ignore[attr-defined]
-            if ga is not None:
-                ctrl.sync_meta_ga(ga)
 
 
 def save_all_base_models(directory: Path) -> None:

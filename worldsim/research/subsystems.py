@@ -137,6 +137,7 @@ class TechnologySubsystem:
                 choice = min(options, key=lambda n: n.cost)
             if self.tree.research_points < choice.cost:
                 break
+            reward_before = nation.reward_snapshot()
             self.tree.research_points -= choice.cost
             self.tree.unlocked.add(choice.name)
             if choice.effect:
@@ -144,7 +145,7 @@ class TechnologySubsystem:
             self._maybe_grow(nation)
             if self.ai is not None and state is not None and idx is not None:
                 new_state = self._build_state(nation)
-                reward = nation.compute_reward("research", state, new_state)
+                reward = nation.compute_reward(reward_before, nation.reward_snapshot())
                 self.ai.train(state, idx, reward, new_state)
             options = self.available()
 

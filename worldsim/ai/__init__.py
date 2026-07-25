@@ -9,10 +9,13 @@ Submodules
 ``roles``            per-role Nelder-Mead facades (WarAI, DiplomacyAI, …)
 ``strategic``        StrategicNelderMeadAI continuous planner
 ``rnn``              PyTorch GRU base models + per-nation LoRA adapters
-                     (war, civilian, fleet, … role controllers)
+                     (war, civilian, fleet, events, … role controllers)
 ``native``           Rust/C++ perceptron banks for division controllers
 ``neat``/``graph``   NEAT-inspired topology evolution
-``meta_ga``          reward-weight genetic algorithm
+``meta_ga``          genetic algorithm for leader/culture trait evolution
+                     (``society.leader``/``society.ideas``) — no longer used
+                     for RL reward weighting, see
+                     ``Nation.compute_reward``/``Nation.reward_snapshot``
 ``embeddings``       action embedding helpers
 ``representations``  galactic state tensors fed to controllers
 ``persistence``      cross-run merging and seeding of trained models

@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from .base import BUFFER_SIZE, _DEVICE, _DOCTRINE_LIST, get_role_model
+from .categorical import _CategoricalRoleController
 from .controller import _RoleController
 
 
@@ -254,6 +255,34 @@ class TorchDoctrineAI(_RoleController):
         """Delegate to DoctrineAI.build_state (same feature extraction)."""
         from ...military.doctrine import DoctrineAI as _DoctrineAI
         return _DoctrineAI.build_state(nation, nations)  # type: ignore[arg-type]
+
+
+class TorchEventAI(_CategoricalRoleController):
+    """Shared categorical (C51) Q-learning agent for the event system.
+
+    Replaces the per-event-name :class:`~worldsim.events.qlearner.EventQLearner`
+    Q-tables with one shared distributional model, LoRA-specialised per
+    nation exactly like every other role. ``n_inputs`` matches
+    :meth:`~worldsim.events.engine.EventDecisionEngine._state_snapshot`
+    (economy, technology.overall, military, infrastructure, stability);
+    ``n_outputs`` is a fixed choice-slot cap — events with fewer options mask
+    the unused slots via ``choose_action``'s ``valid_mask``.
+    """
+
+    MAX_CHOICES: int = 4
+
+    def __init__(
+        self,
+        *,
+        n_inputs:   int   = 5,
+        table_path: Optional[str | Path] = None,
+        epsilon:    float = 0.10,
+        gamma:      float = 0.95,
+    ) -> None:
+        super().__init__(
+            "events", n_inputs, self.MAX_CHOICES, 32,
+            table_path=table_path, epsilon=epsilon, gamma=gamma,
+        )
 
 
 class TorchFleetController(_RoleController):

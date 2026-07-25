@@ -1,19 +1,21 @@
-"""Per-century MetaGA fitness scoring.
+"""Per-century nation fitness scoring.
 
-The score feeds every nation's RewardGA genomes; it rewards stability,
-expansion and a balanced military without runaway militarisation.
+A standalone diagnostic metric: rewards stability, expansion and a balanced
+military without runaway militarisation. Not read by the RL training loop
+(see ``Nation.compute_reward`` / ``Nation.reward_snapshot`` for that) — kept
+here for reporting/analysis.
 """
 
 from __future__ import annotations
 
-from typing import Dict, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..nations import Nation
 
 
 def century_score(n: "Nation") -> int:
-    """Return the MetaGA fitness contribution for one century."""
+    """Return a per-century fitness score summarising *n*'s overall standing."""
     score = 0
     # Economy health
     if n.economy < 10.0:
@@ -48,11 +50,3 @@ def century_score(n: "Nation") -> int:
         score -= 10
         score -= 4 * len(n.divisions)
     return score
-
-
-def apply_century_scores(nations: Dict[int, "Nation"]) -> None:
-    """Step every nation's RewardGA instances with this century's score."""
-    for n in nations.values():
-        score = century_score(n)
-        for ga in n.reward_ga.values():
-            ga.step(score)

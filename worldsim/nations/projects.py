@@ -118,12 +118,13 @@ def start_project(nation: "Nation", name: Optional[str] = None) -> None:
             choice = options[0]
     else:
         choice = name
+    reward_before = nation.reward_snapshot()
     spec = PROJECT_CATALOG[choice]
     nation.projects.append(
         NationalProject(choice, spec.cost, 0.0, spec.on_complete, spec.prereqs)
     )
     new_state = nation._civilian_state()
-    reward = nation.compute_reward("projects", state, new_state)
+    reward = nation.compute_reward(reward_before, nation.reward_snapshot())
     nation.project_ai.train(state, PROJECT_NAMES.index(choice), reward, new_state)
 
 

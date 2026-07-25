@@ -9,7 +9,6 @@ from typing import Dict, List, Set, Tuple
 
 from ..ai.representations import build_alliance_matrix
 from ..ai.rnn import step_all_base_models as _rnn_step_base_models
-from ..ai.rnn import sync_all_meta_ga as _rnn_sync_meta_ga
 from ..core import flags, time_limit, vprint
 from ..core.parallel import pooled_map, shutdown_pool
 from ..diplomacy import (
@@ -30,7 +29,6 @@ from .filters import (
 )
 from .politics import _handle_internal_conflicts
 from .reporting import _print_century_summary
-from .scoring import apply_century_scores
 from .territory import process_planets, update_star_ownership
 
 
@@ -141,13 +139,8 @@ def run_simulation(
                     human_events.extend(commands["events"])
             os.remove(control_path)
         _cull_zombie_nations(nations)
-        apply_century_scores(nations)
         for n in nations.values():
             n.step_meta(century)
-        # Push MetaGA fitness into every RNN controller so epsilon and
-        # reward-scale reflect the current genome's performance before the
-        # next set of simulation fifths begins.
-        _rnn_sync_meta_ga(nations)
 
         # Accumulate events across all 5 fifths; print summary once at the end.
         century_events: list = []
@@ -336,11 +329,8 @@ class SimulationLoop:
         self.century += 1
         if self.century % 20 == 0:
             _apply_great_filter(self.nations)
-        # Per-century MetaGA scoring (shared with run_simulation)
-        apply_century_scores(self.nations)
         for n in self.nations.values():
             n.step_meta(self.century)
-        _rnn_sync_meta_ga(self.nations)
 
         century_events: list = []
 

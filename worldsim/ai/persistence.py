@@ -43,6 +43,7 @@ _ROLE_TO_ATTR: Dict[str, str] = {
     "diplomacy": "diplomacy_ai",
     "research":  "research_ai",
     "doctrine":  "doctrine_ai",
+    "events":    "events_ai",
 }
 
 
@@ -347,36 +348,25 @@ def _apply_fleet_seed(controller, payload: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _save_ga_seed(nations: Dict[int, Nation], path: Path) -> None:
-    """Save merged GA weights to JSON."""
-    all_keys: set = set()
-    for n in nations.values():
-        all_keys.update(n.reward_ga.keys())
-    info: Dict = {"reward_ga": {}, "leader": []}
-    for key in all_keys:
-        gas  = [n.reward_ga[key] for n in nations.values() if key in n.reward_ga]
-        info["reward_ga"][key] = _merge_weights(gas)
-    info["leader"] = _merge_weights([n.leader_model.ga for n in nations.values()])
+    """Save merged leader/culture GA weights to JSON.
+
+    (Directorate reward weighting is no longer GA-evolved — see
+    ``Nation.compute_reward`` — so only the unrelated ``LeaderModel`` culture
+    GA is seeded here now.)
+    """
+    info: Dict = {"leader": _merge_weights([n.leader_model.ga for n in nations.values()])}
     with open(path, "w", encoding="utf8") as fh:
         json.dump(info, fh)
 
 
 def _apply_ga_seed(nations: Dict[int, Nation], path: Path) -> None:
-    """Inject merged GA weights into all nations’ reward GAs."""
+    """Inject merged leader/culture GA weights into all nations."""
     if not path.exists():
         return
     with open(path, encoding="utf8") as fh:
         data = json.load(fh)
-    reward_ga    = data.get("reward_ga", {})
-    leader_w     = data.get("leader", [])
+    leader_w = data.get("leader", [])
     for nation in nations.values():
-        for key, weights in reward_ga.items():
-            if key not in nation.reward_ga:
-                continue
-            ga    = nation.reward_ga[key]
-            n_w   = ga.length
-            seeded = (list(weights) + [1.0] * n_w)[:n_w]
-            for genome in ga.population:
-                genome.weights = list(seeded)
         if leader_w and hasattr(nation, "leader_model"):
             n_w = nation.leader_model.ga.length
             lw  = (list(leader_w) + [1.0] * n_w)[:n_w]
@@ -558,6 +548,7 @@ def _collect_ai_controllers(nation: Nation) -> Dict[str, object]:
         "projects": nation.project_ai,
         "diplomacy": nation.diplomacy_ai,
         "research":  nation.research_ai,
+        "events":    nation.events_ai,
     }
     return {name: ctrl for name, ctrl in controllers.items() if ctrl is not None}
 
@@ -605,17 +596,9 @@ def save_gp_model(
         When omitted a folder named ``<path stem>_ai`` is created alongside
         ``path``.
     """
-    info: Dict[str, object] = {"reward_ga": {}, "leader": []}
-
-    all_keys: set = set()
-    for n in nations.values():
-        all_keys.update(n.reward_ga.keys())
-
-    for key in all_keys:
-        gas = [n.reward_ga[key] for n in nations.values() if key in n.reward_ga]
-        info["reward_ga"][key] = _merge_weights(gas)
-
-    info["leader"] = _merge_weights([n.leader_model.ga for n in nations.values()])
+    info: Dict[str, object] = {
+        "leader": _merge_weights([n.leader_model.ga for n in nations.values()])
+    }
 
     path = Path(path)
     ai_directory = Path(ai_dir).resolve() if ai_dir else path.parent / f"{path.stem}_ai"

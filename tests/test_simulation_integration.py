@@ -631,44 +631,25 @@ class TestFleetControllerIntegration:
 
 
 # ---------------------------------------------------------------------------
-# 10. MetaGA ⇔ LoRA integration
+# 10. Reward function / LoRA evolution
 # ---------------------------------------------------------------------------
 
-class TestMetaGAIntegration:
+class TestRewardAndLoRAEvolution:
     def test_goal_progress_bonus_in_compute_reward(self):
         """compute_reward must return a slightly higher value when active goals
         have positive progress vs a nation with no active goals."""
         nations = make_world()
         n = list(nations.values())[0]
 
-        state     = [0.5] * 20
-        new_state = [0.5] * 20   # identical state → zero base reward
+        snapshot = n.reward_snapshot()   # identical before/after → zero base reward
 
-        r_with_goals    = n.compute_reward("civilian", state, new_state)
+        r_with_goals    = n.compute_reward(snapshot, snapshot)
         # Clear goals and compute again
         n.goals.goals.clear()
-        r_without_goals = n.compute_reward("civilian", state, new_state)
+        r_without_goals = n.compute_reward(snapshot, snapshot)
 
         # With goals present, progress() ≥0 and goal_bonus ≥0, so reward ≥
         assert r_with_goals >= r_without_goals
-
-    def test_epsilon_decreases_after_positive_century_score(self):
-        """After running a century where the nation scores positively, the
-        SimulationLoop.step() call should lower epsilon via sync_all_meta_ga."""
-        from worldsim.engine import SimulationLoop
-        nations = make_world()
-        n = list(nations.values())[0]
-        eps_before = civ_overseer(n).epsilon
-
-        # Give the nation a stable start so it receives a positive score
-        n.stability = 80.0
-        loop = SimulationLoop(nations, log_path=None)
-        loop.step()
-
-        # epsilon should have changed (possibly decreased for positive-scoring
-        # nations, or stayed at base for zero-fitness genomes)
-        # We just verify it's within valid range and is finite
-        assert 0.0 <= civ_overseer(n).epsilon <= 1.0
 
     def test_evolve_meta_mutates_lora(self):
         """evolve_meta() must apply Gaussian noise to all RNN controller LoRAs."""
@@ -704,34 +685,6 @@ class TestMetaGAIntegration:
             f"Optimizer state not cleared after evolve_meta; "
             f"had {old_state_len} entries before reset"
         )
-
-    def test_reward_scale_influences_replay_values(self):
-        """A nation with positive GA fitness should store scaled rewards."""
-        from worldsim.ai.meta_ga import RewardGA
-        nations = make_world()
-        n = list(nations.values())[0]
-
-        # Manually boost fitness and sync
-        for ga in n.reward_ga.values():
-            ga.population[ga.active].fitness = 200.0
-        from worldsim.ai.rnn import sync_all_meta_ga
-        sync_all_meta_ga(nations)
-
-        assert civ_overseer(n)._reward_scale > 1.0, (
-            "reward_scale not increased after positive fitness sync"
-        )
-
-    def test_sync_all_meta_ga_called_in_simulation_loop(self):
-        """SimulationLoop.step() must update epsilon for all controllers.
-        Run two centuries and verify epsilon is in valid range."""
-        from worldsim.engine import SimulationLoop
-        nations = make_world()
-        loop = SimulationLoop(nations, log_path=None)
-        loop.step()
-        loop.step()
-        for n in nations.values():
-            assert 0.0 <= civ_overseer(n).epsilon <= 1.0
-            assert 0.5 <= civ_overseer(n)._reward_scale <= 2.0
 
 
 # ---------------------------------------------------------------------------

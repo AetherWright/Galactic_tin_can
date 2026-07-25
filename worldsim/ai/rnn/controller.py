@@ -1,8 +1,7 @@
 """Per-nation GRU controller with LoRA specialisation.
 
 See the package docstring of :mod:`worldsim.ai.rnn` for the architecture
-overview (rolling input buffer, LoRA adapters, Double DQN training and the
-MetaGA integration).
+overview (rolling input buffer, LoRA adapters and Double DQN training).
 """
 from __future__ import annotations
 
@@ -41,24 +40,9 @@ class RNNController:
     3. The target LoRA is hard-copied from the online LoRA every
        :attr:`TARGET_UPDATE_FREQ` training steps.
 
-    MetaGA integration
-    ------------------
-    :meth:`sync_meta_ga` accepts the nation's :class:`~worldsim.meta_ga.RewardGA`
-    and uses its active genome fitness to:
-
-    * **Adaptive ε-greedy**: ``ε = base_ε · exp(−max(fitness, 0) / 80)``
-      — well-performing genomes exploit their learned policy more.
-    * **Reward scaling**: the TD target is multiplied by a factor that
-      grows with fitness, reinforcing strategies that are objectively
-      working at the simulation level.
-    * **Genome-change detection**: when the GA promotes a new genome
-      (after ``evolve_meta``), the Adam optimiser is reset so momentum
-      buffers from the previous genome's experience do not bias the new
-      reward weighting.
-
     :meth:`mutate_lora` applies Gaussian noise to all LoRA tensors and
-    is called by the nation's ``evolve_meta`` so the behaviour space is
-    explored alongside the new reward landscape.
+    is called by the nation's ``evolve_meta`` on collapse/rebirth so the
+    behaviour space is explored.
 
     Parameters
     ----------
@@ -75,7 +59,7 @@ class RNNController:
     lora_alpha:
         LoRA scaling factor (default 16.0).
     epsilon:
-        Base ε-greedy exploration rate (modulated by MetaGA).
+        ε-greedy exploration rate.
     gamma:
         TD discount factor.
     lr_lora:
@@ -91,10 +75,6 @@ class RNNController:
     _LR_LORA:           float = 3e-4
     # Double DQN: hard-copy online → target every N train calls
     TARGET_UPDATE_FREQ: int   = 16
-    # MetaGA: fitness normalisation constant (≈ max expected per-century score)
-    _FITNESS_SCALE:     float = 80.0
-    # Floor on epsilon even for very high-fitness genomes
-    _EPSILON_FLOOR:     float = 0.02
     # Dynamic LoRA learning-rate warmup (only active when dynamic_lr=True):
     # a fresh controller starts at (1 + BOOST)×base lr and decays back to base
     # over ~WARMUP_STEPS train calls, so freshly-seeded models learn rapidly.
@@ -123,7 +103,6 @@ class RNNController:
         self.lora_r     = lora_r
         self.lora_alpha = lora_alpha
         self.epsilon    = epsilon
-        self._base_epsilon = epsilon   # reference value; GA modulates from here
         self.gamma      = gamma
         self._rng       = random.Random(seed)
 
@@ -157,10 +136,6 @@ class RNNController:
             self._target_A_out = self.lora_A_out.data.clone()
             self._target_B_out = self.lora_B_out.data.clone()
         self._train_steps: int = 0
-
-        # MetaGA integration state
-        self._genome_id:    int   = -1    # last-known active genome index
-        self._reward_scale: float = 1.0   # GA-fitness reward amplifier
 
         # Per-nation recurrent state (detached across turns — truncated BPTT)
         self._h: torch.Tensor = torch.zeros(1, 1, hidden_dim, device=_DEVICE)
@@ -314,34 +289,29 @@ class RNNController:
         reward:     float,
         next_state: Sequence[float],
     ) -> None:
-        """Double DQN update for LoRA parameters with MetaGA reward scaling.
+        """Double DQN update for LoRA parameters.
 
         Double DQN de-couples action *selection* (online network) from
         action *evaluation* (target network), reducing the overestimation
         bias of vanilla DQN::
 
             best_a  = argmax_a  Q_online(s', a)      # main net picks action
-            target  = r * scale + γ · Q_target(s', best_a)  # target net evaluates
+            target  = r + γ · Q_target(s', best_a)   # target net evaluates
 
         The target LoRA is hard-copied from the online LoRA every
-        :attr:`TARGET_UPDATE_FREQ` train calls.  The MetaGA
-        ``_reward_scale`` amplifies the reward for genomes that are
-        performing well at the simulation level, reinforcing successful
-        strategies more strongly.
+        :attr:`TARGET_UPDATE_FREQ` train calls.
 
         The backward pass is serialised through the base model's lock so
         concurrent nation-turn threads cannot corrupt shared parameter
         gradients.  After the LoRA step, base model gradients are zeroed;
         the base model is trained separately via :func:`step_all_base_models`.
 
-        The experience (with scaled reward) is also deposited in the
-        role's replay buffer.
+        The experience is also deposited in the role's replay buffer.
         """
         if not (0 <= action < self.n_outputs):
             return
 
-        # MetaGA reward scaling — amplify signal for well-performing genomes
-        scaled_reward = float(reward) * self._reward_scale
+        reward_val = float(reward)
 
         next_vec  = self._pad(next_state)
         cur_buf   = list(self._buffer)       # buffer has *state* already appended
@@ -362,7 +332,7 @@ class RNNController:
                 best_next_act   = int(next_q_online.argmax(dim=1).item())
                 # 2. Target network evaluates that action (no overestimation)
                 next_q_target   = self._forward_tensor_target(next_seq, h_ref)
-                target_val      = scaled_reward + self.gamma * float(
+                target_val      = reward_val + self.gamma * float(
                     next_q_target[0, best_next_act]
                 )
 
@@ -393,56 +363,18 @@ class RNNController:
         if self._train_steps % self.TARGET_UPDATE_FREQ == 0:
             self._update_target_network()
 
-        # Deposit experience (scaled reward) in the role's replay buffer
-        self.base.add_experience((cur_buf, action, scaled_reward, next_buf))
+        # Deposit experience in the role's replay buffer
+        self.base.add_experience((cur_buf, action, reward_val, next_buf))
 
     # ------------------------------------------------------------------
-    # MetaGA integration
+    # Exploration
     # ------------------------------------------------------------------
-
-    def sync_meta_ga(self, reward_ga: object) -> None:
-        """Synchronise controller hyper-parameters with the MetaGA state.
-
-        Call once per century (after ``ga.step(score)`` has accumulated
-        the century fitness) from :func:`sync_all_meta_ga`.
-
-        Effects
-        -------
-        * **Adaptive ε**: ``ε = base_ε · exp(−max(fitness,0) / FITNESS_SCALE)``
-          clipped to :attr:`_EPSILON_FLOOR`.  Successful genomes exploit
-          their learned policy more; struggling genomes explore more.
-        * **Reward scale**: ``scale = clamp(1 + fitness/200, 0.5, 2.0)``.
-          Positive fitness amplifies the RL reward signal, reinforcing
-          strategies that are genuinely working.
-        * **Genome-change reset**: when the GA promotes a new active
-          genome (i.e. ``reward_ga.active`` differs from the last-seen
-          id), the Adam optimizer state is cleared so stale momentum
-          does not bias the new reward landscape.
-        """
-        new_genome_id = reward_ga.active                            # type: ignore[attr-defined]
-        fitness       = reward_ga.population[new_genome_id].fitness # type: ignore[attr-defined]
-
-        # Detect genome change → reset optimizer so momentum from the
-        # previous genome does not bias the new reward weighting.
-        if new_genome_id != self._genome_id and self._genome_id != -1:
-            self.reset_lora_optimizer()
-        self._genome_id = new_genome_id
-
-        # Fitness-adaptive exploration rate
-        self.epsilon = max(
-            self._EPSILON_FLOOR,
-            self._base_epsilon * math.exp(-max(0.0, fitness) / self._FITNESS_SCALE),
-        )
-
-        # Fitness-adaptive reward scale  (clamped to [0.5, 2.0])
-        self._reward_scale = max(0.5, min(2.0, 1.0 + fitness / 200.0))
 
     def mutate_lora(self, sigma: float = 0.02) -> None:
         """Apply Gaussian noise to all online LoRA tensors.
 
-        Called by the nation's ``evolve_meta`` on collapse / rebirth so
-        the LoRA behaviour space is explored in parallel with the GA's
-        new reward weighting.
+        Called by the nation's ``evolve_meta`` on collapse / rebirth so the
+        LoRA behaviour space is explored.
 
         The target network is synchronised after mutation so it starts
         from the same noisy baseline rather than lagging behind.
@@ -457,8 +389,8 @@ class RNNController:
     def reset_lora_optimizer(self) -> None:
         """Reset the Adam optimizer, clearing momentum/variance buffers.
 
-        Called automatically when the active GA genome changes, and can
-        also be called manually to give the controller a fresh start.
+        Called by the nation's ``evolve_meta`` alongside :meth:`mutate_lora`,
+        and can also be called manually to give the controller a fresh start.
         """
         self._lora_optimizer = optim.Adam(
             [self.lora_A_in, self.lora_B_in,
@@ -484,8 +416,6 @@ class RNNController:
                 "target_B_out":    self._target_B_out,
                 "h":               self._h,
                 "train_steps":     self._train_steps,
-                "reward_scale":    self._reward_scale,
-                "genome_id":       self._genome_id,
             },
             path,
         )
@@ -523,10 +453,8 @@ class RNNController:
             if key in sd:
                 setattr(self, tname, sd[key].to(_DEVICE).clone())
 
-        if "h"            in sd: self._h = sd["h"]
-        if "train_steps"  in sd: self._train_steps  = int(sd["train_steps"])
-        if "reward_scale" in sd: self._reward_scale = float(sd["reward_scale"])
-        if "genome_id"    in sd: self._genome_id    = int(sd["genome_id"])
+        if "h"           in sd: self._h = sd["h"]
+        if "train_steps" in sd: self._train_steps = int(sd["train_steps"])
 
         if shape_changed:
             # Input/output dimensions are implied by the LoRA shapes.  Realign
