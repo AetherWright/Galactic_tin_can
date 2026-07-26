@@ -12,7 +12,7 @@ import random
 import math
 
 from ..ai import (
-    DomesticPolicyAI, ProjectAI, DiplomacyAI, ResearchAI, WarAI,
+    DomesticPolicyAI, ProjectAI, DiplomacyAI, WarAI,
     CivilianOverseerAI, DepartmentPolicyAI,
 )
 from ..diplomacy import (
@@ -117,16 +117,17 @@ from .civilian import (
 
 
 def _iter_rnn_controllers(ctrl: Any):
-    """Yield every underlying torch RNN controller for *ctrl*.
+    """Yield every underlying unified-trunk role view for *ctrl*.
 
     A :class:`CivilianController` is hierarchical: it owns an overseer plus
     one model per department.  Expanding it here lets meta-evolution reach
-    each per-nation LoRA, rather than skipping the wrapper entirely.  Any
-    non-torch (NelderMead / :class:`~worldsim.events.qlearner.EventQLearner`)
-    or ``None`` controller yields nothing.
+    each per-nation head LoRA, rather than skipping the wrapper entirely.
+    Any non-torch (NelderMead / legacy
+    :class:`~worldsim.events.qlearner.EventQLearner`) or ``None`` controller
+    yields nothing.
     """
     try:
-        from ..ai.rnn import CategoricalRNNController, RNNController
+        from ..ai.rnn import UnifiedRoleView
     except Exception:
         return
     if ctrl is None:
@@ -136,7 +137,7 @@ def _iter_rnn_controllers(ctrl: Any):
     else:
         candidates = (ctrl,)
     for c in candidates:
-        if isinstance(c, (RNNController, CategoricalRNNController)):
+        if isinstance(c, UnifiedRoleView):
             yield c
 
 
@@ -211,11 +212,14 @@ class Nation:
     civilian_ai: Optional[DomesticPolicyAI] = field(default=None)
     project_ai: Optional[ProjectAI] = field(default=None)
     diplomacy_ai: Optional[DiplomacyAI] = field(default=None)
-    research_ai: Optional[ResearchAI] = field(default=None)
     # Shared categorical (C51) event Q-learning agent, LoRA-specialised per
     # nation — ``None`` when torch is unavailable, in which case
     # ``EventDecisionEngine`` falls back to its own tabular ``EventQLearner``.
     events_ai: Optional[Any] = field(default=None)
+    # This nation's shared unified-trunk LoRA bank (core LoRA + one head LoRA
+    # per role it uses) — ``None`` when torch is unavailable, in which case
+    # every *_ai attribute above is a legacy (non-torch) controller instead.
+    _unified_bank: Optional[Any] = field(default=None, repr=False)
     action_queue: List[int] = field(default_factory=list)
     inbox: List[Message] = field(default_factory=list)
     leader_model: LeaderModel = field(default_factory=LeaderModel)
@@ -245,7 +249,6 @@ class Nation:
         civilian_path  = self._ai_table_path("civilian")
         project_path   = self._ai_table_path("projects")
         diplomacy_path = self._ai_table_path("diplomacy")
-        research_path  = self._ai_table_path("research")
         doctrine_path  = self._ai_table_path("doctrine")
         events_path    = self._ai_table_path("events")
 
@@ -259,41 +262,40 @@ class Nation:
                 TorchDepartmentAI,
                 TorchProjectAI,
                 TorchDiplomacyAI,
-                TorchResearchAI,
                 TorchDoctrineAI,
                 TorchEventAI,
+                UnifiedLoRABank,
             )
             _use_torch = rnn_available()
         except Exception:  # ImportError or anything else
             _use_torch = False
 
         if _use_torch:
+            bank = UnifiedLoRABank(core_state_fn=self.unified_core_state)
+            self._unified_bank = bank
             self.military_ai  = TorchWarAI(
-                allies_dim=ally_dim, table_path=military_path
+                allies_dim=ally_dim, table_path=military_path, bank=bank,
             )
             self.civilian_ai  = CivilianController(
                 overseer=TorchCivilianOverseer(
-                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22,
+                    n_depts=N_CIVILIAN_DEPARTMENTS, n_inputs=22, bank=bank,
                 ),
                 dept_models={
                     dept.slug: TorchDepartmentAI(
-                        dept.slug, dept.n_actions, n_inputs=22,
+                        dept.slug, dept.n_actions, n_inputs=22, bank=bank,
                     )
                     for dept in DEPARTMENTS
                 },
                 base_table_path=civilian_path,
             )
             self.project_ai   = TorchProjectAI(
-                len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
+                len(PROJECT_CATALOG), n_inputs=22, table_path=project_path, bank=bank,
             )
             self.diplomacy_ai = TorchDiplomacyAI(
-                3, n_inputs=5, table_path=diplomacy_path
+                3, n_inputs=5, table_path=diplomacy_path, bank=bank,
             )
-            self.research_ai  = TorchResearchAI(
-                len(self.tech_tree.nodes), n_inputs=4, table_path=research_path
-            )
-            self.doctrine_ai  = TorchDoctrineAI(table_path=doctrine_path)
-            self.events_ai    = TorchEventAI(table_path=events_path)
+            self.doctrine_ai  = TorchDoctrineAI(table_path=doctrine_path, bank=bank)
+            self.events_ai    = TorchEventAI(table_path=events_path, bank=bank)
         else:
             self.military_ai  = WarAI(allies_dim=ally_dim, table_path=military_path)
             self.civilian_ai  = CivilianController(
@@ -312,9 +314,6 @@ class Nation:
                 len(PROJECT_CATALOG), n_inputs=6, table_path=project_path
             )
             self.diplomacy_ai = DiplomacyAI(3, n_inputs=5, table_path=diplomacy_path)
-            self.research_ai  = ResearchAI(
-                len(self.tech_tree.nodes), n_inputs=4, table_path=research_path
-            )
             # DoctrineAI runs AFTER civilian and diplomacy AIs each fifth
             self.doctrine_ai  = DoctrineAI(table_path=doctrine_path)
 
@@ -435,10 +434,14 @@ class Nation:
     def __post_init__(self) -> None:
         self.relations = {nid: "neutral" for nid in self.all_ids if nid != self.id}
         self.border_pressure = {nid: 0.0 for nid in self.all_ids if nid != self.id}
-        setup_default_tech_tree(self)
         self.division_templates["Infantry"] = DivisionTemplate("Infantry", 1000)
         ally_dim = max(1, len(self.all_ids)) if self.all_ids else 1
+        # Build the AI controllers (and this nation's shared unified LoRA
+        # bank, when torch is available) before the tech tree, so the
+        # research subsystems' attach_ai() can bind to the same bank as
+        # every other role.
         self._init_ai_controllers(ally_dim)
+        setup_default_tech_tree(self)
         self.doctrine = self.military_ai.create_doctrine()
         if self.doctrine not in self.available_doctrines:
             self.available_doctrines.append(self.doctrine)
@@ -514,6 +517,29 @@ class Nation:
             self._fleet_count(),
         ]
 
+    def unified_core_state(self) -> List[float]:
+        """Canonical 16-feature input every unified-trunk role sees.
+
+        The same 8 outcome fields as :meth:`reward_snapshot`, NN-scaled
+        instead of reward-scaled, plus the nation's 8
+        :class:`~worldsim.society.culture.Culture` traits (already 0..1) in
+        ``Culture.__dataclass_fields__`` order — this is what lets every
+        role's decision (war, civilian, diplomacy, research, ...) condition
+        on the nation's culture: see
+        :mod:`worldsim.ai.rnn.unified` for how it's consumed.
+        """
+        return [
+            self.economy / 100.0,
+            self.stability / 100.0,
+            self.military / 100.0,
+            self.technology.overall / 100.0,
+            self.infrastructure / 100.0,
+            float(self.population) / 1_000_000.0,
+            float(self.star_count) / 10.0,
+            self._fleet_count() / 10.0,
+            *self.culture.asdict().values(),
+        ]
+
     def compute_reward(self, before: List[float], after: List[float]) -> float:
         """Return the reward for a *before* → *after* :meth:`reward_snapshot` pair.
 
@@ -540,22 +566,32 @@ class Nation:
         self.leader_model.evolve()
         self.leader = self.leader_model.generate(self)
         self.last_collapse = self.current_year
-        # Mutate LoRA + reset optimizers for every RNN controller so the
-        # behaviour space is explored on collapse/rebirth.  Silent failure
-        # when torch is absent or controllers are the legacy NelderMead type.
+        # Mutate LoRA + reset optimizers for every role view (and the shared
+        # core LoRA) so the behaviour space is explored on collapse/rebirth.
+        # Silent failure when torch is absent or controllers are the legacy
+        # NelderMead type.
         try:
+            if self._unified_bank is not None:
+                self._unified_bank.mutate_core(sigma=0.02)
+                self._unified_bank.reset_core_optimizer()
             _CTRL_ATTRS = (
                 "civilian_ai", "military_ai", "project_ai",
-                "diplomacy_ai", "research_ai", "doctrine_ai", "events_ai",
+                "diplomacy_ai", "doctrine_ai", "events_ai",
             )
             for attr in _CTRL_ATTRS:
                 ctrl = getattr(self, attr, None)
                 # The civilian AI is a hierarchical CivilianController wrapping
                 # an overseer plus one model per department; expand it so each
-                # underlying RNN controller is evolved.
+                # underlying role view is evolved.
                 for sub in _iter_rnn_controllers(ctrl):
                     sub.mutate_lora(sigma=0.02)
                     sub.reset_lora_optimizer()
+            # Research subsystems (physics/engineering/biology) live under
+            # tech_tree (a ResearchDirector), not a direct Nation attribute.
+            for sub in getattr(self.tech_tree, "subsystems", ()):
+                for view in _iter_rnn_controllers(getattr(sub, "ai", None)):
+                    view.mutate_lora(sigma=0.02)
+                    view.reset_lora_optimizer()
         except Exception:
             pass
 
@@ -778,7 +814,6 @@ class Nation:
         self.tech_tree.research(
             self.economy * 0.05 + research_bonus,
             self,
-            self.research_ai,
         )
         self.produce_nuclear_weapons()
         self.progress_projects()

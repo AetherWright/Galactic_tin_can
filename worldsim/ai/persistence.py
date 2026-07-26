@@ -41,7 +41,6 @@ _ROLE_TO_ATTR: Dict[str, str] = {
     "civilian":  "civilian_ai",
     "projects":  "project_ai",
     "diplomacy": "diplomacy_ai",
-    "research":  "research_ai",
     "doctrine":  "doctrine_ai",
     "events":    "events_ai",
 }
@@ -437,13 +436,13 @@ def merge_and_save_models(
         with open(seed_dir / "seed_fleet.yml", "w", encoding="utf8") as fh:
             _yaml.safe_dump(fleet_payload, fh, default_flow_style=False)
 
-    # --- torch RNN base models (shared backbone per role × dims) ---
+    # --- torch unified trunk (shared across every role/nation) ---
     # The PyTorch controllers don't fit the NelderMead seed format; persist
-    # their shared base models as a directory of .pt checkpoints instead.
+    # the shared trunk as its own checkpoint instead.
     try:
-        from .rnn import rnn_available, save_all_base_models
+        from .rnn import rnn_available, save_trunk
         if rnn_available():
-            save_all_base_models(seed_dir / "torch_bases")
+            save_trunk(seed_dir / "torch_trunk.pt")
     except Exception:
         pass
 
@@ -514,12 +513,12 @@ def load_model_seeds(
         except OSError:
             pass
 
-    # --- torch RNN base models ---
+    # --- torch unified trunk ---
     try:
-        from .rnn import rnn_available, load_all_base_models
-        bases_dir = seed_dir / "torch_bases"
-        if rnn_available() and bases_dir.exists():
-            load_all_base_models(bases_dir)
+        from .rnn import rnn_available, load_trunk
+        trunk_path = seed_dir / "torch_trunk.pt"
+        if rnn_available() and trunk_path.exists():
+            load_trunk(trunk_path)
             loaded = True
     except Exception:
         pass
@@ -541,14 +540,19 @@ def load_model_seeds(
 # ---------------------------------------------------------------------------
 
 def _collect_ai_controllers(nation: Nation) -> Dict[str, object]:
-    """Return all reinforcement controllers attached to *nation*."""
+    """Return all reinforcement controllers attached to *nation*.
+
+    ``"core"`` is the nation's shared unified-trunk LoRA bank (see
+    ``worldsim.ai.rnn.unified.UnifiedLoRABank``) — absent when torch is
+    unavailable, in which case every other entry is a legacy controller.
+    """
     controllers = {
         "military": nation.military_ai,
         "civilian": nation.civilian_ai,
         "projects": nation.project_ai,
         "diplomacy": nation.diplomacy_ai,
-        "research":  nation.research_ai,
         "events":    nation.events_ai,
+        "core":      nation._unified_bank,
     }
     return {name: ctrl for name, ctrl in controllers.items() if ctrl is not None}
 

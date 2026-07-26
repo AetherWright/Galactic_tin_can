@@ -63,7 +63,9 @@ class TechnologySubsystem:
 
     def __init__(self) -> None:
         self.tree = TechnologyTree()
-        self.ai: Optional[ResearchAI] = None
+        #: Either a legacy (non-torch) ResearchAI or a unified-trunk
+        #: TorchResearchSubsystemAI — see :meth:`attach_ai`.
+        self.ai: Optional[object] = None
         self.director: Optional["ResearchDirector"] = None
         #: Names of the hand-authored (non-procedural) technologies.  Populated
         #: by :meth:`finalize_bases` after the director has injected any extra
@@ -101,15 +103,34 @@ class TechnologySubsystem:
         """Record the full base graph (called after all injection is done)."""
         self.base_names = set(self.tree.nodes)
 
-    def attach_ai(self) -> None:
-        """Create this subsystem's :class:`ResearchAI` using :attr:`_n_inputs`."""
+    def attach_ai(self, nation: "Nation") -> None:
+        """Create this subsystem's AI using :attr:`_n_inputs`.
+
+        Prefers a unified-trunk :class:`~worldsim.ai.rnn.roles.TorchResearchSubsystemAI`
+        head (LoRA-specialised on the nation's shared bank, same as every
+        other role) when torch is available; falls back to the legacy
+        (non-torch) :class:`~worldsim.ai.ResearchAI` otherwise.
+        """
         n_actions = len(self.tree.nodes)
         if n_actions <= 0:
             self.ai = None
             return
-        # # TODO: Aether — hidden-layer topology per subsystem; the ResearchAI
-        # # default ``(10, 8, 6, 4, 3, 4, 6, 8, 10)`` is a placeholder.
-        self.ai = ResearchAI(n_actions, n_inputs=self._n_inputs)
+        try:
+            from ..ai.rnn import TorchResearchSubsystemAI, rnn_available
+            _use_torch = rnn_available() and nation._unified_bank is not None
+        except Exception:
+            _use_torch = False
+        if _use_torch:
+            self.ai = TorchResearchSubsystemAI(
+                self.name, n_actions, self._n_inputs,
+                table_path=nation._ai_table_path(f"research_{self.name}"),
+                bank=nation._unified_bank,
+            )
+        else:
+            # # TODO: Aether — hidden-layer topology per subsystem; the
+            # # ResearchAI default ``(10, 8, 6, 4, 3, 4, 6, 8, 10)`` is a
+            # # placeholder.
+            self.ai = ResearchAI(n_actions, n_inputs=self._n_inputs)
 
     # -- per-tick research -------------------------------------------------
     def _build_state(self, nation: "Nation") -> Optional[List[float]]:

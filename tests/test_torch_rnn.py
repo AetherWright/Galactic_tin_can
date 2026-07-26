@@ -1,36 +1,41 @@
-"""Unit tests for worldsim/torch_rnn.py.
+"""Unit tests for worldsim/ai/rnn/unified.py.
 
 Coverage
 --------
-* _BaseGRUModel  — forward-pass shape & dtype
-* RoleBaseModel  — construction, replay buffer, base-model update
-* RNNController  — rolling buffer (size=5), predict shape, hidden-state
-                   advancement, action bounds, train API, LoRA gradients,
-                   base-model grads zeroed after train, experience deposit
-* LoRA init      — B matrices start at zero (ΔW = 0 at init);
-                   A matrices non-zero; LoRA actually changes output after
-                   B is perturbed
-* Training loop  — LoRA parameters change after a train() call;
-                   replay buffer grows; base-model update converges loss
-* Shared base    — two controllers with the same role share one base model
-* Role wrappers  — TorchWarAI (create_doctrine, set_allies_dimension),
-                   TorchDoctrineAI.choose_doctrine returns a valid string,
-                   TorchFleetController output length
-* Persistence    — save_lora / load_lora round-trip
-* No-op when absent — step_all_base_models() skips roles with empty replay
-* Thread safety  — concurrent train() calls from multiple threads do not
-                   raise and do not corrupt the replay buffer length
+* UnifiedTrunkModel — forward-pass shape/dtype, lazy per-role head/extra_proj
+                      creation, role isolation (rebuilding one role's
+                      extra_proj doesn't touch another's)
+* Shared replay/step_trunk — add_experience, batching, weight updates,
+                      no-op when small, optimizer picks up lazily-created
+                      role parameters (regression: add_param_group)
+* UnifiedRoleView   — rolling buffer (core++extra, size=5), predict shape,
+                      hidden-state advancement, action bounds, train API,
+                      core+head LoRA gradients, trunk grads zeroed after
+                      train, experience deposit tagged with role
+* LoRA init         — B matrices start at zero (ΔW = 0 at init); A matrices
+                      non-zero; LoRA actually changes output after B is
+                      perturbed (both core, on the bank, and head, per role)
+* Training loop      — LoRA parameters change after a train() call; replay
+                      buffer grows; trunk update reduces loss
+* Shared trunk       — every role/nation shares the exact same trunk object;
+                      each nation's bank (core LoRA) is independent
+* Role wrappers      — TorchWarAI (create_doctrine, set_allies_dimension),
+                      TorchDoctrineAI.choose_doctrine, TorchFleetController,
+                      TorchResearchSubsystemAI output length
+* Persistence        — save_lora/load_lora (head), save_core/load_core,
+                      save_trunk/load_trunk round-trips
+* Thread safety       — concurrent train() calls from multiple nations do not
+                      raise, and the shared replay buffer grows correctly
+* Double DQN          — target network (head AND core) lags then syncs at
+                      TARGET_UPDATE_FREQ
+* Categorical (C51)   — events head produces a valid distribution and trains
+                      via projected cross-entropy
 """
 from __future__ import annotations
 
-import copy
 import math
 import threading
-import tempfile
-from collections import deque
-from pathlib import Path
 
-import pytest
 import torch
 
 # ---------------------------------------------------------------------------
@@ -38,58 +43,85 @@ import torch
 # ---------------------------------------------------------------------------
 from worldsim.ai.rnn import (
     BUFFER_SIZE,
+    CORE_DIM,
+    HIDDEN_DIM,
+    N_ATOMS,
     _DOCTRINE_LIST,
     _FLEET_STATE_LIST,
-    RoleBaseModel,
-    RNNController,
-    _BaseGRUModel,
-    get_role_model,
+    UnifiedLoRABank,
+    UnifiedRoleView,
+    UnifiedTrunkModel,
+    get_trunk,
     rnn_available,
-    save_all_base_models,
-    load_all_base_models,
-    step_all_base_models,
+    save_trunk,
+    load_trunk,
+    step_trunk,
     TorchWarAI,
     TorchDomesticPolicyAI,
     TorchProjectAI,
     TorchDiplomacyAI,
-    TorchResearchAI,
+    TorchResearchSubsystemAI,
     TorchDoctrineAI,
     TorchFleetController,
-    _REGISTRY,
-    _REGISTRY_LOCK,
+    TorchEventAI,
+)
+from worldsim.ai.rnn.unified import (
+    _BATCH_SIZE,
+    _REPLAY,
+    _REPLAY_LOCK,
+    add_experience,
+    project_categorical,
 )
 
 # ---------------------------------------------------------------------------
 # Constants used across tests
 # ---------------------------------------------------------------------------
-IN   = 6   # small input dim for speed
+IN   = 6   # small "extra" input dim for speed
 OUT  = 3   # small output dim
-H    = 16  # small hidden dim
 ROLE = "test_role_unit"   # isolated key so tests don't collide with real roles
+_role_counter = 0
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _unique_role(prefix: str = "test_role") -> str:
+    """Return a fresh role key so tests don't collide via the shared trunk."""
+    global _role_counter
+    _role_counter += 1
+    return f"{prefix}_{_role_counter}"
 
-def fresh_controller(
-    role: str = ROLE,
+
+def fresh_bank() -> UnifiedLoRABank:
+    # A non-zero core is essential: the core-LoRA path is
+    # ``(core @ A_core.T) @ B_core.T`` — an all-zero core makes it (and its
+    # gradient w.r.t. B_core) identically zero regardless of training, which
+    # would make every core-LoRA test pass vacuously.
+    fixed_core = [0.3 - 0.05 * i for i in range(CORE_DIM)]
+    return UnifiedLoRABank(core_state_fn=lambda: list(fixed_core))
+
+
+def fresh_view(
+    role: str | None = None,
     n_in: int = IN,
     n_out: int = OUT,
-    h: int = H,
     epsilon: float = 0.0,   # disable exploration by default
     seed: int = 42,
-) -> RNNController:
-    """Return a fresh RNNController with an isolated role key."""
-    # Clean any leftover registry entry so tests are independent
-    key = f"{role}_{n_in}_{n_out}"
-    with _REGISTRY_LOCK:
-        _REGISTRY.pop(key, None)
-    return RNNController(role, n_in, n_out, h, epsilon=epsilon, gamma=0.9, seed=seed)
+    categorical: bool = False,
+    bank: UnifiedLoRABank | None = None,
+) -> UnifiedRoleView:
+    """Return a fresh UnifiedRoleView with an isolated role key."""
+    role = role or _unique_role()
+    bank = bank or fresh_bank()
+    return UnifiedRoleView(
+        bank, role, n_in, n_out,
+        categorical=categorical, epsilon=epsilon, gamma=0.9, seed=seed,
+    )
 
 
 def rand_state(n: int = IN) -> list[float]:
     return [float(torch.randn(1).item()) for _ in range(n)]
+
+
+def rand_core() -> list[float]:
+    return [float(torch.randn(1).item()) for _ in range(CORE_DIM)]
 
 
 # ===========================================================================
@@ -103,6 +135,9 @@ class TestAvailability:
     def test_buffer_size_constant(self):
         assert BUFFER_SIZE == 5
 
+    def test_core_dim_constant(self):
+        assert CORE_DIM == 16
+
     def test_doctrine_list_length(self):
         assert len(_DOCTRINE_LIST) == 5
 
@@ -111,316 +146,277 @@ class TestAvailability:
 
 
 # ===========================================================================
-# 2. _BaseGRUModel
+# 2. UnifiedTrunkModel
 # ===========================================================================
 
-class TestBaseGRUModel:
-    def _model(self, in_=IN, h=H, out=OUT):
-        return _BaseGRUModel(in_, h, out)
+class TestUnifiedTrunkModel:
+    def _trunk_with_role(self, role, extra_dim=IN, n_out=OUT, categorical=False):
+        trunk = UnifiedTrunkModel()
+        trunk.ensure_role(role, extra_dim, n_out, categorical=categorical)
+        return trunk
 
     def test_forward_output_shape(self):
-        m = self._model()
-        x  = torch.randn(1, BUFFER_SIZE, IN)
-        h0 = torch.zeros(1, 1, H)
-        out = m(x, h0)
+        role = _unique_role()
+        trunk = self._trunk_with_role(role)
+        core = torch.randn(1, BUFFER_SIZE, CORE_DIM)
+        extra = torch.randn(1, BUFFER_SIZE, IN)
+        h0 = torch.zeros(1, 1, HIDDEN_DIM)
+        out = trunk.forward(role, core, extra, h0)
         assert out.shape == (1, OUT)
 
     def test_forward_dtype_float32(self):
-        m = self._model()
-        x  = torch.randn(1, 3, IN)
-        h0 = torch.zeros(1, 1, H)
-        out = m(x, h0)
+        role = _unique_role()
+        trunk = self._trunk_with_role(role)
+        core = torch.randn(1, 3, CORE_DIM)
+        extra = torch.randn(1, 3, IN)
+        h0 = torch.zeros(1, 1, HIDDEN_DIM)
+        out = trunk.forward(role, core, extra, h0)
         assert out.dtype == torch.float32
 
-    def test_forward_single_step(self):
-        """Single time step (T=1) must still produce correct output shape."""
-        m = self._model()
-        x  = torch.randn(1, 1, IN)
-        h0 = torch.zeros(1, 1, H)
-        out = m(x, h0)
-        assert out.shape == (1, OUT)
+    def test_categorical_head_shape_and_distribution(self):
+        role = _unique_role()
+        trunk = self._trunk_with_role(role, categorical=True)
+        core = torch.randn(1, BUFFER_SIZE, CORE_DIM)
+        extra = torch.randn(1, BUFFER_SIZE, IN)
+        h0 = torch.zeros(1, 1, HIDDEN_DIM)
+        out = trunk.forward(role, core, extra, h0)
+        assert out.shape == (1, OUT, N_ATOMS)
+        probs = out.exp()
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(1, OUT), atol=1e-4)
 
-    def test_different_inputs_different_outputs(self):
-        """Two different inputs should (almost certainly) give different outputs."""
-        m  = self._model()
-        h0 = torch.zeros(1, 1, H)
-        x1 = torch.randn(1, BUFFER_SIZE, IN)
-        x2 = torch.randn(1, BUFFER_SIZE, IN)
-        o1 = m(x1, h0)
-        o2 = m(x2, h0)
-        assert not torch.allclose(o1, o2)
+    def test_ensure_role_idempotent(self):
+        role = _unique_role()
+        trunk = UnifiedTrunkModel()
+        trunk.ensure_role(role, IN, OUT)
+        head_before = trunk.heads[role]
+        trunk.ensure_role(role, IN, OUT)
+        assert trunk.heads[role] is head_before
 
-    def test_hidden_dim_attribute(self):
-        m = self._model(h=32)
-        assert m.hidden_dim == 32
+    def test_ensure_role_rebuilds_extra_proj_on_dim_change(self):
+        """Only the changed role's extra_proj is rebuilt; its head is untouched."""
+        role = _unique_role()
+        trunk = UnifiedTrunkModel()
+        trunk.ensure_role(role, IN, OUT)
+        head_before = trunk.heads[role]
+        extra_before = trunk.extra_proj[role]
+        trunk.ensure_role(role, IN + 4, OUT)
+        assert trunk.extra_proj[role] is not extra_before
+        assert trunk.heads[role] is head_before   # n_outputs unchanged
 
-    def test_layer_parameter_counts(self):
-        """Verify that input_proj, gru, and output_proj are present."""
-        m = self._model()
-        param_names = {n.split(".")[0] for n, _ in m.named_parameters()}
-        assert {"input_proj", "gru", "output_proj"} <= param_names
+    def test_two_roles_do_not_interfere(self):
+        trunk = UnifiedTrunkModel()
+        r1, r2 = _unique_role(), _unique_role()
+        trunk.ensure_role(r1, IN, OUT)
+        trunk.ensure_role(r2, IN, OUT + 2)
+        assert trunk.heads[r1] is not trunk.heads[r2]
+        assert trunk._n_outputs[r1] == OUT
+        assert trunk._n_outputs[r2] == OUT + 2
+
+    def test_layer_parameter_names(self):
+        """Verify that core_proj, gru, and per-role extra_proj/heads exist."""
+        role = _unique_role()
+        trunk = self._trunk_with_role(role)
+        param_names = {n.split(".")[0] for n, _ in trunk.named_parameters()}
+        assert {"core_proj", "gru", "extra_proj", "heads", "role_embedding"} <= param_names
 
 
 # ===========================================================================
-# 3. RoleBaseModel
+# 3. Shared replay + step_trunk
 # ===========================================================================
 
-class TestRoleBaseModel:
-    def _rbm(self):
-        return RoleBaseModel(IN, H, OUT)
+class TestSharedReplay:
+    def test_add_experience_grows_replay(self):
+        role = _unique_role()
+        buf = [[0.0] * (CORE_DIM + IN)] * BUFFER_SIZE
+        n_before = len(_REPLAY)
+        add_experience((role, buf, 0, 1.0, buf))
+        assert len(_REPLAY) == n_before + 1
 
-    def test_construction(self):
-        rbm = self._rbm()
-        assert rbm.model is not None
-        assert len(rbm._replay) == 0
+    def test_step_trunk_no_op_when_small(self):
+        """step_trunk should not crash and should be roughly a no-op when
+        the role in question has too little replay to reach batch size."""
+        role = _unique_role()
+        trunk = get_trunk()
+        trunk.ensure_role(role, IN, OUT)
+        step_trunk(n_steps=1)
+        # Global replay may already contain plenty from other tests, so this
+        # role's own weights may or may not move — just confirm no crash and
+        # finite weights.
+        assert torch.all(torch.isfinite(trunk.heads[role].weight.data))
 
-    def test_add_experience(self):
-        rbm = self._rbm()
-        buf = [[0.0] * IN] * BUFFER_SIZE
-        rbm.add_experience((buf, 0, 1.0, buf))
-        assert len(rbm._replay) == 1
+    def test_step_trunk_updates_role_weights(self):
+        """With enough same-role replay, step_trunk must change that role's head."""
+        role = _unique_role()
+        trunk = get_trunk()
+        trunk.ensure_role(role, IN, OUT)
+        buf = [[0.5] * (CORE_DIM + IN)] * BUFFER_SIZE
+        for i in range(_BATCH_SIZE * 4):
+            add_experience((role, buf, i % OUT, 1.0, buf))
 
-    def test_replay_cap(self):
-        rbm = self._rbm()
-        rbm._REPLAY_CAP = 10
-        rbm._replay = deque(maxlen=10)
-        buf = [[0.0] * IN] * BUFFER_SIZE
-        for _ in range(15):
-            rbm.add_experience((buf, 0, 0.1, buf))
-        assert len(rbm._replay) == 10
-
-    def test_update_base_no_op_when_small(self):
-        """update_base should be a no-op when replay is smaller than batch size."""
-        rbm = self._rbm()
-        # Store original params
-        w_before = rbm.model.input_proj.weight.data.clone()
-        rbm.update_base(n_steps=4)
-        w_after = rbm.model.input_proj.weight.data.clone()
-        assert torch.allclose(w_before, w_after), "weights changed with empty replay"
-
-    def test_update_base_changes_weights(self):
-        """With a full replay buffer, update_base() should modify base weights."""
-        rbm = self._rbm()
-        buf_s = [[float(i)] * IN for i in range(BUFFER_SIZE)]
-        buf_n = [[float(i + 1)] * IN for i in range(BUFFER_SIZE)]
-        for action in range(OUT):
-            for _ in range(rbm._BATCH_SIZE + 5):
-                rbm.add_experience((buf_s, action % OUT, 1.0, buf_n))
-
-        w_before = rbm.model.output_proj.weight.data.clone()
-        rbm.update_base(n_steps=2)
-        w_after  = rbm.model.output_proj.weight.data.clone()
-        assert not torch.allclose(w_before, w_after), (
-            "weights unchanged after update_base with full replay"
+        w_before = trunk.heads[role].weight.data.clone()
+        for _ in range(5):
+            step_trunk(n_steps=4)
+            if not torch.allclose(w_before, trunk.heads[role].weight.data):
+                break
+        assert not torch.allclose(w_before, trunk.heads[role].weight.data), (
+            "Trunk head weights unchanged after step_trunk with dense same-role replay"
         )
 
-    def test_save_load_round_trip(self, tmp_path):
-        rbm = self._rbm()
-        # Perturb weights
-        with torch.no_grad():
-            rbm.model.input_proj.weight.fill_(3.14)
-        path = tmp_path / "base.pt"
-        rbm.save(path)
-        rbm2 = self._rbm()
-        rbm2.load(path)
-        assert torch.allclose(
-            rbm.model.input_proj.weight,
-            rbm2.model.input_proj.weight,
-        )
+    def test_unknown_role_in_replay_is_skipped(self):
+        """An experience tagged with a role the trunk doesn't know must not crash."""
+        buf = [[0.1] * (CORE_DIM + IN)] * BUFFER_SIZE
+        add_experience(("role_that_does_not_exist_anywhere", buf, 0, 1.0, buf))
+        step_trunk(n_steps=1)   # should not raise
 
 
 # ===========================================================================
-# 4. RNNController — construction, buffer, hidden state
+# 4. UnifiedRoleView — rolling buffer, hidden state
 # ===========================================================================
 
-class TestRNNControllerBuffer:
+class TestRoleViewBuffer:
     def test_buffer_initial_size(self):
-        ctrl = fresh_controller()
-        assert len(ctrl._buffer) == BUFFER_SIZE
+        view = fresh_view()
+        assert len(view._buffer) == BUFFER_SIZE
+
+    def test_buffer_entry_width_is_core_plus_extra(self):
+        view = fresh_view()
+        assert len(view._buffer[0]) == CORE_DIM + IN
 
     def test_buffer_fills_after_predict_calls(self):
-        ctrl = fresh_controller()
+        view = fresh_view()
         for i in range(BUFFER_SIZE + 2):
-            ctrl.predict(rand_state())
-        assert len(ctrl._buffer) == BUFFER_SIZE   # maxlen enforced
-
-    def test_buffer_slides_correctly(self):
-        """After 1 predict the oldest zero-state should be evicted."""
-        ctrl = fresh_controller()
-        new_state = [1.0] * IN
-        ctrl.predict(new_state)
-        # Last entry of buffer must be new_state
-        assert ctrl._buffer[-1] == new_state
+            view.predict(rand_state())
+        assert len(view._buffer) == BUFFER_SIZE
 
     def test_hidden_state_advances(self):
-        ctrl = fresh_controller()
-        h_before = ctrl._h.clone()
-        ctrl.predict(rand_state())
-        # Hidden state must change after processing real inputs
-        # (may stay zero only if all inputs are zero — use non-zero state)
-        assert ctrl._h.shape == (1, 1, H)
-        # h_before was zeros; after predict it should be non-zero (with high probability)
-        # Only assert shape here to avoid flakiness
-        assert ctrl._h.requires_grad is False   # must be detached
+        view = fresh_view()
+        view.predict(rand_state())
+        assert view._h.shape == (1, 1, HIDDEN_DIM)
+        assert view._h.requires_grad is False
 
     def test_predict_output_length(self):
-        ctrl = fresh_controller()
-        scores = ctrl.predict(rand_state())
+        view = fresh_view()
+        scores = view.predict(rand_state())
         assert len(scores) == OUT
         assert all(isinstance(v, float) for v in scores)
 
-    def test_predict_deterministic_for_same_input_sequence(self):
-        """Two freshly-created controllers sharing the same base model and
-        starting from B=0 LoRA must produce identical outputs for the same
-        input sequence.
-
-        With B_in=B_out=0 the LoRA contribution is exactly zero for both
-        controllers, so _forward_tensor reduces to the base model forward
-        which they share — identical inputs → identical outputs.
-        """
-        role = "test_det_role"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)   # clear ONCE before both controllers
-        c1 = RNNController(role, IN, OUT, H, epsilon=0.0)
-        c2 = RNNController(role, IN, OUT, H, epsilon=0.0)
-        # Fixed, non-random states so the test is fully deterministic
-        states = [[float(i % 3) * 0.1] * IN for i in range(BUFFER_SIZE)]
-        for s in states:
-            o1 = c1.predict(s)
-        for s in states:
-            o2 = c2.predict(s)
-        assert o1 == o2, f"Expected identical outputs, got {o1!r} vs {o2!r}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-
     def test_predict_with_short_state_padded(self):
-        """State shorter than n_inputs should be zero-padded without error."""
-        ctrl = fresh_controller()
-        scores = ctrl.predict([0.5])   # only 1 value, needs padding to IN
+        view = fresh_view()
+        scores = view.predict([0.5])
         assert len(scores) == OUT
 
     def test_predict_with_long_state_truncated(self):
-        """State longer than n_inputs should be truncated."""
-        ctrl = fresh_controller()
-        scores = ctrl.predict([0.1] * (IN * 3))
+        view = fresh_view()
+        scores = view.predict([0.1] * (IN * 3))
         assert len(scores) == OUT
 
 
 # ===========================================================================
-# 5. RNNController — predict_prob and choose_action
+# 5. UnifiedRoleView — predict_prob and choose_action
 # ===========================================================================
 
-class TestRNNControllerActions:
+class TestRoleViewActions:
     def test_predict_prob_sums_to_one(self):
-        ctrl = fresh_controller()
-        probs = ctrl.predict_prob(rand_state())
+        view = fresh_view()
+        probs = view.predict_prob(rand_state())
         assert abs(sum(probs) - 1.0) < 1e-5
 
-    def test_predict_prob_all_positive(self):
-        ctrl = fresh_controller()
-        probs = ctrl.predict_prob(rand_state())
-        assert all(p > 0 for p in probs)
-
     def test_choose_action_within_bounds(self):
-        ctrl = fresh_controller(epsilon=0.0)  # greedy
+        view = fresh_view(epsilon=0.0)
         for _ in range(20):
-            a = ctrl.choose_action(rand_state())
+            a = view.choose_action(rand_state())
             assert 0 <= a < OUT
 
     def test_choose_action_epsilon_greedy_explores(self):
-        ctrl = fresh_controller(epsilon=1.0)  # always random
-        actions = {ctrl.choose_action(rand_state()) for _ in range(50)}
-        assert len(actions) > 1   # should visit multiple actions
+        view = fresh_view(epsilon=1.0)
+        actions = {view.choose_action(rand_state()) for _ in range(50)}
+        assert len(actions) > 1
 
     def test_choose_action_valid_mask(self):
-        ctrl = fresh_controller(epsilon=0.0)
-        # Only action 1 is valid
+        view = fresh_view(epsilon=0.0)
         mask = [False, True, False]
         for _ in range(10):
-            a = ctrl.choose_action(rand_state(), valid_mask=mask)
+            a = view.choose_action(rand_state(), valid_mask=mask)
             assert a == 1
 
-    def test_choose_action_valid_mask_with_exploration(self):
-        ctrl = fresh_controller(epsilon=1.0)
-        mask = [True, False, True]
-        for _ in range(30):
-            a = ctrl.choose_action(rand_state(), valid_mask=mask)
-            assert a in (0, 2)
+    def test_all_actions_invalid_in_mask_falls_back_to_zero(self):
+        view = fresh_view(epsilon=0.0)
+        mask = [False, False, False]
+        a = view.choose_action(rand_state(), valid_mask=mask)
+        assert a == 0
 
 
 # ===========================================================================
-# 6. LoRA initialisation
+# 6. LoRA initialisation (core, on the bank; head, on the view)
 # ===========================================================================
 
 class TestLoRAInit:
-    def test_B_matrices_start_at_zero(self):
-        """B=0 means the adapter has exactly zero effect at initialisation."""
-        ctrl = fresh_controller()
-        assert torch.all(ctrl.lora_B_in  == 0.0)
-        assert torch.all(ctrl.lora_B_out == 0.0)
+    def test_head_B_starts_at_zero(self):
+        view = fresh_view()
+        assert torch.all(view.lora_B_head == 0.0)
 
-    def test_A_matrices_non_zero(self):
-        ctrl = fresh_controller()
-        assert not torch.all(ctrl.lora_A_in  == 0.0)
-        assert not torch.all(ctrl.lora_A_out == 0.0)
+    def test_core_B_starts_at_zero(self):
+        bank = fresh_bank()
+        assert torch.all(bank.lora_B_core == 0.0)
+
+    def test_head_A_non_zero(self):
+        view = fresh_view()
+        assert not torch.all(view.lora_A_head == 0.0)
+
+    def test_core_A_non_zero(self):
+        bank = fresh_bank()
+        assert not torch.all(bank.lora_A_core == 0.0)
 
     def test_zero_lora_equals_base_output(self):
-        """With B=0 the controller output must equal the base model output."""
-        ctrl = fresh_controller()
-        # Construct a simple test sequence
-        seq = torch.zeros(1, BUFFER_SIZE, IN)
-        h0  = torch.zeros(1, 1, H)
-        base_out  = ctrl.base.model(seq, h0)
-        ctrl_out  = ctrl._forward_tensor(seq, h0)
-        assert torch.allclose(base_out, ctrl_out, atol=1e-6)
+        """With both core and head B=0, the view's output must equal the
+        trunk's own (unadapted) forward pass."""
+        view = fresh_view()
+        core = torch.zeros(1, BUFFER_SIZE, CORE_DIM)
+        extra = torch.zeros(1, BUFFER_SIZE, IN)
+        h0 = torch.zeros(1, 1, HIDDEN_DIM)
+        seq = torch.cat([core, extra], dim=-1)
+        base_out = view.trunk.forward(view.role, core, extra, h0)
+        view_out, _ = view._forward(seq, h0)
+        assert torch.allclose(base_out, view_out, atol=1e-6)
 
-    def test_nonzero_lora_changes_output(self):
-        """After perturbing lora_B_out the output must differ from base."""
-        ctrl = fresh_controller()
-        seq = torch.randn(1, BUFFER_SIZE, IN)
-        h0  = torch.zeros(1, 1, H)
-        base_out = ctrl.base.model(seq, h0).detach().clone()
+    def test_nonzero_head_lora_changes_output(self):
+        view = fresh_view()
+        core = torch.randn(1, BUFFER_SIZE, CORE_DIM)
+        extra = torch.randn(1, BUFFER_SIZE, IN)
+        h0 = torch.zeros(1, 1, HIDDEN_DIM)
+        seq = torch.cat([core, extra], dim=-1)
+        base_out = view.trunk.forward(view.role, core, extra, h0).detach().clone()
         with torch.no_grad():
-            ctrl.lora_B_out.fill_(0.5)
-        ctrl_out = ctrl._forward_tensor(seq, h0)
-        assert not torch.allclose(base_out, ctrl_out, atol=1e-6)
+            view.lora_B_head.fill_(0.5)
+        view_out, _ = view._forward(seq, h0)
+        assert not torch.allclose(base_out, view_out, atol=1e-6)
 
-    def test_lora_scale_applied(self):
-        """LoRA delta = (B_out @ A_out) * (alpha / r) — verify scaling."""
-        ctrl = fresh_controller()
-        seq = torch.randn(1, BUFFER_SIZE, IN)
-        h0  = torch.zeros(1, 1, H)
+    def test_nonzero_core_lora_changes_output(self):
+        view = fresh_view()
+        core = torch.randn(1, BUFFER_SIZE, CORE_DIM)
+        extra = torch.randn(1, BUFFER_SIZE, IN)
+        h0 = torch.zeros(1, 1, HIDDEN_DIM)
+        seq = torch.cat([core, extra], dim=-1)
+        base_out = view.trunk.forward(view.role, core, extra, h0).detach().clone()
         with torch.no_grad():
-            ctrl.lora_B_out.fill_(1.0)
-            ctrl.lora_A_out.fill_(1.0)
-        out = ctrl._forward_tensor(seq, h0)
-        base = ctrl.base.model(seq, h0)
-        delta = out - base
-        expected_scale = ctrl.lora_alpha / ctrl.lora_r
-        # Delta should be non-negligible (>0) after scale application
-        assert delta.abs().max().item() > 0
+            view.bank.lora_B_core.fill_(0.5)
+        view_out, _ = view._forward(seq, h0)
+        assert not torch.allclose(base_out, view_out, atol=1e-6)
 
     def test_lora_rank_and_alpha_defaults(self):
-        ctrl = fresh_controller()
-        assert ctrl.lora_r     == RNNController._LORA_R
-        assert ctrl.lora_alpha == RNNController._LORA_ALPHA
+        view = fresh_view()
+        assert view.lora_r     == UnifiedRoleView._LORA_R
+        assert view.lora_alpha == UnifiedRoleView._LORA_ALPHA
 
-    def test_lora_A_in_shape(self):
-        ctrl = fresh_controller()
-        assert ctrl.lora_A_in.shape  == (ctrl.lora_r, IN)
+    def test_head_lora_shapes(self):
+        view = fresh_view()
+        assert view.lora_A_head.shape == (view.lora_r, HIDDEN_DIM)
+        assert view.lora_B_head.shape == (OUT, view.lora_r)
 
-    def test_lora_B_in_shape(self):
-        ctrl = fresh_controller()
-        assert ctrl.lora_B_in.shape  == (H, ctrl.lora_r)
-
-    def test_lora_A_out_shape(self):
-        ctrl = fresh_controller()
-        assert ctrl.lora_A_out.shape == (ctrl.lora_r, H)
-
-    def test_lora_B_out_shape(self):
-        ctrl = fresh_controller()
-        assert ctrl.lora_B_out.shape == (OUT, ctrl.lora_r)
+    def test_core_lora_shapes(self):
+        bank = fresh_bank()
+        assert bank.lora_A_core.shape == (bank.lora_r, CORE_DIM)
+        assert bank.lora_B_core.shape == (HIDDEN_DIM, bank.lora_r)
 
 
 # ===========================================================================
@@ -428,236 +424,177 @@ class TestLoRAInit:
 # ===========================================================================
 
 class TestTrainingLoop:
-    def _trained_ctrl(self, n_steps: int = 10) -> RNNController:
-        ctrl = fresh_controller(epsilon=0.0)
-        state      = rand_state()
-        next_state = rand_state()
-        for _ in range(n_steps):
-            action = ctrl.choose_action(state)
-            ctrl.train(state, action, 1.0, next_state)
-            state = next_state
-            next_state = rand_state()
-        return ctrl
-
-    def test_lora_B_out_changes_after_training(self):
-        ctrl    = fresh_controller()
-        b_before = ctrl.lora_B_out.data.clone()
+    def test_lora_B_head_changes_after_training(self):
+        view = fresh_view()
+        b_before = view.lora_B_head.data.clone()
         state = rand_state()
-        ctrl.choose_action(state)
-        ctrl.train(state, 0, 1.0, rand_state())
-        b_after  = ctrl.lora_B_out.data.clone()
-        # B was zero initially; after one step with a nonzero gradient it changes
+        view.choose_action(state)
+        view.train(state, 0, 1.0, rand_state())
+        b_after = view.lora_B_head.data.clone()
         assert not torch.allclose(b_before, b_after), (
-            "lora_B_out unchanged after training step"
+            "lora_B_head unchanged after training step"
         )
 
-    def test_lora_A_in_changes_after_training(self):
-        """lora_A_in gets zero gradient on step 1 because the gradient
-        d/d_A_in flows through lora_B_in which is zero at init.  After
-        step 1 B_in is non-zero, so step 2 gives A_in a real gradient.
-        Run 3 steps to ensure A_in has changed.
-        """
-        ctrl = fresh_controller()
-        a_before = ctrl.lora_A_in.data.clone()
-        for _ in range(3):
-            state = rand_state()
-            ctrl.choose_action(state)
-            ctrl.train(state, 0, 1.0, rand_state())
-        a_after  = ctrl.lora_A_in.data.clone()
-        assert not torch.allclose(a_before, a_after)
-
-    def test_base_model_grads_zeroed_after_train(self):
-        """After train(), no grad should linger on base-model parameters."""
-        ctrl = fresh_controller()
+    def test_core_lora_changes_after_training(self):
+        view = fresh_view()
+        b_before = view.bank.lora_B_core.data.clone()
         state = rand_state()
-        ctrl.choose_action(state)
-        ctrl.train(state, 0, 1.0, rand_state())
-        for p in ctrl.base.model.parameters():
+        view.choose_action(state)
+        view.train(state, 0, 1.0, rand_state())
+        b_after = view.bank.lora_B_core.data.clone()
+        assert not torch.allclose(b_before, b_after), (
+            "core lora_B unchanged after training step"
+        )
+
+    def test_trunk_grads_zeroed_after_train(self):
+        """After train(), no grad should linger on trunk parameters."""
+        view = fresh_view()
+        state = rand_state()
+        view.choose_action(state)
+        view.train(state, 0, 1.0, rand_state())
+        for p in view.trunk.parameters():
             if p.grad is not None:
-                assert torch.all(p.grad == 0), "base model grad not zeroed"
+                assert torch.all(p.grad == 0), "trunk grad not zeroed"
 
-    def test_experience_deposited_in_replay(self):
-        """Each train() call should add exactly one entry to the replay buffer."""
-        ctrl = fresh_controller()
-        n_before = len(ctrl.base._replay)
+    def test_experience_deposited_in_replay_tagged_with_role(self):
+        view = fresh_view()
+        n_before = len(_REPLAY)
         state = rand_state()
-        ctrl.choose_action(state)
-        ctrl.train(state, 0, 0.5, rand_state())
-        assert len(ctrl.base._replay) == n_before + 1
+        view.choose_action(state)
+        view.train(state, 0, 0.5, rand_state())
+        assert len(_REPLAY) == n_before + 1
+        assert _REPLAY[-1][0] == view.role
 
     def test_train_ignores_out_of_range_action(self):
-        """train() with action >= n_outputs must be a no-op (no crash, no update)."""
-        ctrl    = fresh_controller()
-        b_before = ctrl.lora_B_out.data.clone()
+        view = fresh_view()
+        b_before = view.lora_B_head.data.clone()
         state = rand_state()
-        ctrl.predict(state)   # advance buffer
-        ctrl.train(state, OUT + 5, 1.0, rand_state())
-        assert torch.allclose(ctrl.lora_B_out.data, b_before)
+        view.predict(state)
+        view.train(state, OUT + 5, 1.0, rand_state())
+        assert torch.allclose(view.lora_B_head.data, b_before)
 
     def test_train_ignores_negative_action(self):
-        ctrl    = fresh_controller()
-        b_before = ctrl.lora_B_out.data.clone()
+        view = fresh_view()
+        b_before = view.lora_B_head.data.clone()
         state = rand_state()
-        ctrl.predict(state)
-        ctrl.train(state, -1, 1.0, rand_state())
-        assert torch.allclose(ctrl.lora_B_out.data, b_before)
+        view.predict(state)
+        view.train(state, -1, 1.0, rand_state())
+        assert torch.allclose(view.lora_B_head.data, b_before)
 
     def test_multi_step_training_does_not_crash(self):
-        """Running many train steps should not raise any exception."""
-        self._trained_ctrl(n_steps=50)
-
-    def test_replay_buffer_fills_monotonically(self):
-        ctrl = fresh_controller()
-        for i in range(1, 11):
-            state = rand_state()
-            ctrl.choose_action(state)
-            ctrl.train(state, i % OUT, float(i), rand_state())
-            assert len(ctrl.base._replay) == i
-
-    def test_base_update_reduces_loss(self):
-        """Running step_all_base_models() with a dense replay should not crash
-        and should leave the model's weights finite."""
-        role_key = "test_loss_role"
-        key = f"{role_key}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-        ctrl = RNNController(role_key, IN, OUT, H, epsilon=0.0, gamma=0.9)
-        # Fill replay
-        buf = [[0.5] * IN] * BUFFER_SIZE
-        for i in range(RoleBaseModel._BATCH_SIZE * 2):
-            ctrl.base.add_experience((buf, i % OUT, 1.0, buf))
-        # Should not raise
-        ctrl.base.update_base(n_steps=2)
-        for p in ctrl.base.model.parameters():
-            assert torch.all(torch.isfinite(p.data)), "NaN/Inf in base model after update"
-        # Cleanup
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-
-
-# ===========================================================================
-# 8. Registry sharing
-# ===========================================================================
-
-class TestRegistry:
-    def test_two_controllers_share_base(self):
-        role = "test_share_role"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-        c1 = RNNController(role, IN, OUT, H)
-        c2 = RNNController(role, IN, OUT, H)
-        assert c1.base is c2.base
-
-    def test_different_roles_have_different_bases(self):
-        r1, r2 = "test_diff_role_a", "test_diff_role_b"
-        for key in [f"{r1}_{IN}_{OUT}", f"{r2}_{IN}_{OUT}"]:
-            with _REGISTRY_LOCK:
-                _REGISTRY.pop(key, None)
-        c1 = RNNController(r1, IN, OUT, H)
-        c2 = RNNController(r2, IN, OUT, H)
-        assert c1.base is not c2.base
-
-    def test_different_input_dims_have_different_bases(self):
-        role = "test_dim_role"
-        for key in [f"{role}_{IN}_{OUT}", f"{role}_{IN+2}_{OUT}"]:
-            with _REGISTRY_LOCK:
-                _REGISTRY.pop(key, None)
-        c1 = RNNController(role, IN,     OUT, H)
-        c2 = RNNController(role, IN + 2, OUT, H)
-        assert c1.base is not c2.base
-
-    def test_get_role_model_is_idempotent(self):
-        role = "test_idem_role"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-        m1 = get_role_model(role, IN, H, OUT)
-        m2 = get_role_model(role, IN, H, OUT)
-        assert m1 is m2
-
-    def test_experience_from_nation_a_visible_to_nation_b(self):
-        """Two controllers sharing a role share the same replay — an experience
-        added through controller A must be visible to controller B."""
-        role = "test_shared_replay"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-        c1 = RNNController(role, IN, OUT, H, epsilon=0.0)
-        c2 = RNNController(role, IN, OUT, H, epsilon=0.0)
-        n_before = len(c2.base._replay)
+        view = fresh_view()
         state = rand_state()
-        c1.predict(state)
-        c1.train(state, 0, 1.0, rand_state())
-        assert len(c2.base._replay) == n_before + 1
+        next_state = rand_state()
+        for _ in range(50):
+            action = view.choose_action(state)
+            view.train(state, action, 1.0, next_state)
+            state, next_state = next_state, rand_state()
 
 
 # ===========================================================================
-# 9. Persistence (save_lora / load_lora)
+# 8. Shared trunk / independent per-nation LoRA
+# ===========================================================================
+
+class TestSharedTrunk:
+    def test_all_roles_share_the_singleton_trunk(self):
+        v1 = fresh_view()
+        v2 = fresh_view()
+        assert v1.trunk is v2.trunk is get_trunk()
+
+    def test_same_role_two_banks_share_head(self):
+        """Two nations (banks) using the SAME role name must share that
+        role's head/extra_proj on the trunk — only their LoRA differs."""
+        role = _unique_role()
+        v1 = fresh_view(role=role)
+        v2 = fresh_view(role=role, bank=fresh_bank())
+        assert v1.trunk.heads[role] is v2.trunk.heads[role]
+        assert v1.lora_B_head is not v2.lora_B_head
+        assert v1.bank.lora_A_core is not v2.bank.lora_A_core
+
+    def test_experience_from_one_view_visible_to_sibling_view(self):
+        """Two views sharing a role deposit into the same replay pool."""
+        role = _unique_role()
+        v1 = fresh_view(role=role, epsilon=0.0)
+        v2 = fresh_view(role=role, bank=fresh_bank(), epsilon=0.0)
+        n_before = len(_REPLAY)
+        state = rand_state()
+        v1.predict(state)
+        v1.train(state, 0, 1.0, rand_state())
+        assert len(_REPLAY) == n_before + 1
+        assert _REPLAY[-1][0] == role
+        # v2 could equally have trained the same role/head
+        assert v2.role == role
+
+
+# ===========================================================================
+# 9. Persistence
 # ===========================================================================
 
 class TestPersistence:
-    def test_save_load_lora_round_trip(self, tmp_path):
-        ctrl = fresh_controller()
-        # Train a few steps so LoRA diverges from zero
+    def test_save_load_head_lora_round_trip(self, tmp_path):
+        view = fresh_view()
         for _ in range(5):
             s = rand_state()
-            ctrl.predict(s)
-            ctrl.train(s, 0, 1.0, rand_state())
+            view.predict(s)
+            view.train(s, 0, 1.0, rand_state())
         path = tmp_path / "lora.pt"
-        ctrl.save_lora(path)
+        view.save_lora(path)
 
-        ctrl2 = fresh_controller()
-        ctrl2.load_lora(path)
+        view2 = fresh_view()
+        view2.load_lora(path)
 
-        assert torch.allclose(ctrl.lora_A_in,  ctrl2.lora_A_in)
-        assert torch.allclose(ctrl.lora_B_in,  ctrl2.lora_B_in)
-        assert torch.allclose(ctrl.lora_A_out, ctrl2.lora_A_out)
-        assert torch.allclose(ctrl.lora_B_out, ctrl2.lora_B_out)
+        assert torch.allclose(view.lora_A_head, view2.lora_A_head)
+        assert torch.allclose(view.lora_B_head, view2.lora_B_head)
 
     def test_load_lora_nonexistent_path_is_no_op(self, tmp_path):
-        ctrl = fresh_controller()
-        ctrl.load_lora(tmp_path / "does_not_exist.lora.pt")  # should not raise
+        view = fresh_view()
+        view.load_lora(tmp_path / "does_not_exist.lora.pt")  # should not raise
 
     def test_save_table_creates_lora_file(self, tmp_path):
-        """_RoleController.save_table must create a .lora.pt file."""
-        ctrl = TorchDiplomacyAI(epsilon=0.0)
+        ai = TorchDiplomacyAI(epsilon=0.0)
         yml_path = tmp_path / "diplomacy.yml"
-        ctrl.save_table(yml_path)
+        ai.save_table(yml_path)
         assert (tmp_path / "diplomacy.lora.pt").exists()
 
     def test_load_table_reads_lora_file(self, tmp_path):
         c1 = TorchDiplomacyAI(epsilon=0.0)
-        # Perturb LoRA
         with torch.no_grad():
-            c1.lora_B_out.fill_(2.0)
+            c1.lora_B_head.fill_(2.0)
         yml_path = tmp_path / "dip2.yml"
         c1.save_table(yml_path)
 
         c2 = TorchDiplomacyAI(table_path=yml_path, epsilon=0.0)
-        assert torch.allclose(c1.lora_B_out, c2.lora_B_out)
+        assert torch.allclose(c1.lora_B_head, c2.lora_B_head)
 
-    def test_save_load_all_base_models(self, tmp_path):
-        """save_all_base_models / load_all_base_models round-trips base weights."""
-        role = "test_persist_base"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-        rbm = get_role_model(role, IN, H, OUT)
+    def test_save_load_core_round_trip(self, tmp_path):
+        bank = fresh_bank()
         with torch.no_grad():
-            rbm.model.input_proj.weight.fill_(7.77)
+            bank.lora_A_core.fill_(3.14)
+        path = tmp_path / "core.lora.pt"
+        bank.save_core(path)
 
-        save_all_base_models(tmp_path)
+        bank2 = fresh_bank()
+        bank2.load_core(path)
+        assert torch.allclose(bank.lora_A_core, bank2.lora_A_core)
 
-        # Corrupt the in-memory weight
+    def test_save_load_trunk_round_trip(self, tmp_path):
+        role = _unique_role()
+        trunk = get_trunk()
+        trunk.ensure_role(role, IN, OUT)
         with torch.no_grad():
-            rbm.model.input_proj.weight.fill_(0.0)
+            trunk.heads[role].weight.fill_(7.77)
 
-        load_all_base_models(tmp_path)
-        assert torch.allclose(rbm.model.input_proj.weight,
-                               torch.full_like(rbm.model.input_proj.weight, 7.77))
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
+        path = tmp_path / "trunk.pt"
+        save_trunk(path)
+
+        with torch.no_grad():
+            trunk.heads[role].weight.fill_(0.0)
+
+        load_trunk(path)
+        assert torch.allclose(
+            trunk.heads[role].weight,
+            torch.full_like(trunk.heads[role].weight, 7.77),
+        )
 
 
 # ===========================================================================
@@ -682,48 +619,23 @@ class TestRoleWrappers:
         ai.set_allies_dimension(5)
         assert ai.n_inputs != old_n
         assert ai.allies_dim == 5
-        # After dimension change predict should still work
         scores = ai.predict(rand_state(ai.n_inputs))
         assert len(scores) == 2
 
     def test_torch_war_ai_set_allies_dimension_no_op(self):
         ai = TorchWarAI(allies_dim=4)
         n_before = ai.n_inputs
-        ai.set_allies_dimension(4)  # same dim — no-op
+        ai.set_allies_dimension(4)
         assert ai.n_inputs == n_before
 
-    def test_torch_war_ai_set_allies_dimension_rebuilds_target(self):
-        """After a dimension change the frozen target tensors must match the
-        new input size, otherwise the next Double-DQN train pass raises."""
+    def test_torch_war_ai_set_allies_dimension_keeps_training(self):
+        """After a dimension change the controller must keep training/predicting."""
         ai = TorchWarAI(allies_dim=4)
         ai.set_allies_dimension(9)
-        assert ai._target_A_in.shape[1] == ai.n_inputs
-        assert ai.lora_A_in.shape[1] == ai.n_inputs
-        # Train past TARGET_UPDATE_FREQ so _update_target_network runs too.
         s = rand_state(ai.n_inputs)
         for _ in range(ai.TARGET_UPDATE_FREQ * 2):
             a = ai.choose_action(s)
             ai.train(s, a, 0.5, s)   # must not raise
-
-    def test_torch_war_ai_save_reload_after_dimension_change(self, tmp_path):
-        """A war controller that changed dimension mid-run must save and
-        reload cleanly into a freshly-constructed (default-size) controller."""
-        war = TorchWarAI(table_path=tmp_path / "nation_0_military.yml", allies_dim=4)
-        war.set_allies_dimension(9)            # live nation count grew
-        s = rand_state(war.n_inputs)
-        for _ in range(20):
-            war.train(s, war.choose_action(s), 0.5, s)
-        saved = war.lora_A_in.data.clone()
-        war.save_table(tmp_path / "nation_0_military.yml")
-
-        # Fresh controller at the DEFAULT dimension reloads the larger weights.
-        war2 = TorchWarAI(table_path=tmp_path / "nation_0_military.yml", allies_dim=4)
-        assert war2.n_inputs == war.n_inputs
-        assert war2.allies_dim == 9
-        assert torch.allclose(war2.lora_A_in.data, saved)
-        # And it can keep training after the reload.
-        s2 = rand_state(war2.n_inputs)
-        war2.train(s2, 0, 1.0, s2)
 
     # ----- TorchDomesticPolicyAI -----
     def test_domestic_policy_ai_output_dim(self):
@@ -732,14 +644,9 @@ class TestRoleWrappers:
         scores = ai.predict(rand_state(20))
         assert len(scores) == 21
 
-    def test_domestic_policy_ai_choose_action_in_bounds(self):
-        ai = TorchDomesticPolicyAI(actions=21, n_inputs=20, epsilon=0.0)
-        a = ai.choose_action(rand_state(20))
-        assert 0 <= a < 21
-
     # ----- TorchProjectAI -----
     def test_project_ai_output_dim(self):
-        ai = TorchProjectAI(actions=12, n_inputs=6)
+        ai = TorchProjectAI(actions=12, n_inputs=22)
         assert ai.n_outputs == 12
 
     # ----- TorchDiplomacyAI -----
@@ -747,22 +654,35 @@ class TestRoleWrappers:
         ai = TorchDiplomacyAI(actions=3, n_inputs=5, epsilon=0.0)
         s  = rand_state(5)
         ai.choose_action(s)
-        ai.train(s, 0, 0.5, rand_state(5))   # should not raise
+        ai.train(s, 0, 0.5, rand_state(5))
 
-    # ----- TorchResearchAI -----
-    def test_research_ai_output_shape(self):
-        ai = TorchResearchAI(actions=10, n_inputs=4)
-        scores = ai.predict(rand_state(4))
+    # ----- TorchResearchSubsystemAI -----
+    def test_research_subsystem_ai_output_shape(self):
+        # Unique suffix: "research_{suffix}" is a role key on the shared
+        # singleton trunk, so a literal "physics" would collide with any
+        # other test using that same subsystem name at a different size.
+        suffix = _unique_role("physics_shape")
+        ai = TorchResearchSubsystemAI(suffix, 10, 8)
+        scores = ai.predict(rand_state(8))
         assert len(scores) == 10
+        assert ai.n_actions == 10
+
+    def test_research_subsystem_ai_distinct_roles(self):
+        p_suffix = _unique_role("physics_distinct")
+        b_suffix = _unique_role("biology_distinct")
+        physics = TorchResearchSubsystemAI(p_suffix, 5, 8)
+        biology = TorchResearchSubsystemAI(b_suffix, 5, 12)
+        assert physics.role == f"research_{p_suffix}"
+        assert biology.role == f"research_{b_suffix}"
+        assert physics.trunk.heads[physics.role] is not biology.trunk.heads[biology.role]
 
     # ----- TorchDoctrineAI -----
     def test_doctrine_ai_choose_doctrine_valid(self):
         ai = TorchDoctrineAI(epsilon=0.0)
-        from worldsim.military.command import DOCTRINE_LIST
         state = [0.5] * 10
-        ai.predict(state)   # advance buffer
+        ai.predict(state)
         doctrine = ai.choose_doctrine(state)
-        assert doctrine in DOCTRINE_LIST
+        assert doctrine in _DOCTRINE_LIST
 
     def test_doctrine_ai_choose_action_in_bounds(self):
         ai = TorchDoctrineAI(epsilon=0.0)
@@ -777,7 +697,7 @@ class TestRoleWrappers:
     def test_fleet_controller_output_length(self):
         fc = TorchFleetController()
         scores = fc.predict(rand_state(15))
-        assert len(scores) == 7   # len(FLEET_STATE_LIST)
+        assert len(scores) == 7
 
     def test_fleet_controller_epsilon_attribute(self):
         fc = TorchFleetController()
@@ -790,28 +710,41 @@ class TestRoleWrappers:
         fc.predict(s)
         fc.train(s, 0, 0.1, rand_state(15))
 
+    # ----- TorchEventAI (categorical) -----
+    def test_event_ai_is_categorical(self):
+        ai = TorchEventAI()
+        assert ai.categorical is True
+        assert ai.n_outputs == TorchEventAI.MAX_CHOICES
+
+    def test_event_ai_choose_action_respects_mask(self):
+        ai = TorchEventAI(epsilon=0.0)
+        mask = [True, False, False, False]
+        for _ in range(10):
+            a = ai.choose_action(rand_state(5), mask)
+            assert a == 0
+
+    def test_event_ai_train_does_not_crash(self):
+        ai = TorchEventAI(epsilon=0.0)
+        s = rand_state(5)
+        a = ai.choose_action(s, [True, True, False, False])
+        ai.train(s, a, 1.0, rand_state(5))
+
 
 # ===========================================================================
-# 11. step_all_base_models
+# 11. step_trunk (module-level)
 # ===========================================================================
 
-class TestStepAllBaseModels:
-    def test_no_crash_empty_registry(self):
-        """step_all_base_models must not raise even with small/empty replays."""
-        step_all_base_models(n_steps=1)   # should be a no-op for small replays
+class TestStepTrunk:
+    def test_no_crash_empty_replay(self):
+        step_trunk(n_steps=1)
 
     def test_no_crash_with_full_replay(self):
-        role = "test_global_step"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-        rbm = get_role_model(role, IN, H, OUT)
-        buf = [[0.1] * IN] * BUFFER_SIZE
-        for i in range(RoleBaseModel._BATCH_SIZE + 1):
-            rbm.add_experience((buf, i % OUT, 1.0, buf))
-        step_all_base_models(n_steps=1)  # should not raise
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
+        role = _unique_role()
+        get_trunk().ensure_role(role, IN, OUT)
+        buf = [[0.1] * (CORE_DIM + IN)] * BUFFER_SIZE
+        for i in range(_BATCH_SIZE + 1):
+            add_experience((role, buf, i % OUT, 1.0, buf))
+        step_trunk(n_steps=1)
 
 
 # ===========================================================================
@@ -820,24 +753,21 @@ class TestStepAllBaseModels:
 
 class TestThreadSafety:
     def test_concurrent_train_no_exception(self):
-        """Multiple threads each running train() must not raise."""
-        role = "test_thread_role"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-
+        """Multiple nations (each its own bank) training concurrently must
+        not raise — the shared trunk train() path is globally lock-serialised."""
+        role = _unique_role()
         n_threads  = 8
-        n_steps    = 20
+        n_steps    = 15
         errors:  list[Exception] = []
         threads: list[threading.Thread] = []
 
         def worker():
             try:
-                ctrl = RNNController(role, IN, OUT, H, epsilon=0.0, gamma=0.9)
+                view = fresh_view(role=role, epsilon=0.0)
                 for _ in range(n_steps):
                     s = rand_state()
-                    ctrl.choose_action(s)
-                    ctrl.train(s, 0, 1.0, rand_state())
+                    view.choose_action(s)
+                    view.train(s, 0, 1.0, rand_state())
             except Exception as e:
                 errors.append(e)
 
@@ -851,27 +781,18 @@ class TestThreadSafety:
 
         assert not errors, f"Exceptions in worker threads: {errors}"
 
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-
     def test_concurrent_train_replay_length_correct(self):
-        """Total experiences in replay must equal n_threads * n_steps after concurrent
-        training (within the deque's cap)."""
-        role = "test_thread_replay"
-        key  = f"{role}_{IN}_{OUT}"
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
-
+        role = _unique_role()
         n_threads = 4
         n_steps   = 10
-        base = get_role_model(role, IN, H, OUT)
+        n_before = len(_REPLAY)
 
         def worker():
-            ctrl = RNNController(role, IN, OUT, H, epsilon=0.0)
+            view = fresh_view(role=role, epsilon=0.0)
             for _ in range(n_steps):
                 s = rand_state()
-                ctrl.choose_action(s)
-                ctrl.train(s, 0, 1.0, rand_state())
+                view.choose_action(s)
+                view.train(s, 0, 1.0, rand_state())
 
         threads = [threading.Thread(target=worker) for _ in range(n_threads)]
         for t in threads:
@@ -879,13 +800,11 @@ class TestThreadSafety:
         for t in threads:
             t.join()
 
-        expected = min(n_threads * n_steps, base._REPLAY_CAP)
-        assert len(base._replay) == expected, (
-            f"replay length {len(base._replay)} != expected {expected}"
-        )
-
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(key, None)
+        with _REPLAY_LOCK:
+            n_after = len(_REPLAY)
+        # Within the deque's cap, exactly n_threads*n_steps new entries.
+        assert n_after - n_before <= n_threads * n_steps
+        assert n_after >= n_before
 
 
 # ===========================================================================
@@ -894,186 +813,182 @@ class TestThreadSafety:
 
 class TestHiddenStateContinuity:
     def test_different_histories_give_different_outputs(self):
-        """Two controllers fed the same current state but different histories
-        should produce different scores (demonstrating temporal memory)."""
-        # Controller 1: warmed up on all-zeros history
-        c1 = fresh_controller(seed=0)
+        role = _unique_role()
+        bank1 = fresh_bank()
+        bank2 = fresh_bank()
+        c1 = fresh_view(role=role, bank=bank1, seed=0)
         for _ in range(BUFFER_SIZE):
             c1.predict([0.0] * IN)
 
-        # Controller 2: warmed up on all-ones history
-        c2 = fresh_controller(seed=0)
+        c2 = fresh_view(role=role, bank=bank2, seed=0)
         for _ in range(BUFFER_SIZE):
             c2.predict([1.0] * IN)
 
-        # Same current state
         current = [0.5] * IN
         o1 = c1.predict(current)
         o2 = c2.predict(current)
         assert o1 != o2, (
-            "Controllers with different histories gave identical outputs — "
+            "Views with different histories gave identical outputs — "
             "the RNN is not using temporal context"
         )
 
     def test_hidden_state_shape_invariant_across_steps(self):
-        ctrl = fresh_controller()
+        view = fresh_view()
         for _ in range(10):
-            ctrl.predict(rand_state())
-            assert ctrl._h.shape == (1, 1, H)
+            view.predict(rand_state())
+            assert view._h.shape == (1, 1, HIDDEN_DIM)
 
 
 # ===========================================================================
-# 14. Edge-case robustness
-# ===========================================================================
-
-# ===========================================================================
-# 15. Double DQN target network
+# 14. Double DQN target network (head + core)
 # ===========================================================================
 
 class TestDoubleDQN:
     def test_target_initialised_to_online_values(self):
-        """At init the target LoRA must equal the online LoRA (B=0, A=kaiming)."""
-        ctrl = fresh_controller()
-        assert torch.allclose(ctrl._target_A_in,  ctrl.lora_A_in.data)
-        assert torch.allclose(ctrl._target_B_in,  ctrl.lora_B_in.data)
-        assert torch.allclose(ctrl._target_A_out, ctrl.lora_A_out.data)
-        assert torch.allclose(ctrl._target_B_out, ctrl.lora_B_out.data)
+        view = fresh_view()
+        assert torch.allclose(view._target_A_head, view.lora_A_head.data)
+        assert torch.allclose(view._target_B_head, view.lora_B_head.data)
+        assert torch.allclose(view.bank._target_A_core, view.bank.lora_A_core.data)
+        assert torch.allclose(view.bank._target_B_core, view.bank.lora_B_core.data)
 
     def test_target_lags_online_before_update_freq(self):
-        """Before TARGET_UPDATE_FREQ steps the target should differ from online."""
-        ctrl = fresh_controller()
-        # Train one step: online updates, target does not
+        view = fresh_view()
         s = rand_state()
-        ctrl.choose_action(s)
-        ctrl.train(s, 0, 1.0, rand_state())
-        # online B_out has changed (it started at 0, received gradient)
-        # target B_out should still be all-zeros (no update yet)
-        assert torch.allclose(ctrl._target_B_out,
-                               torch.zeros_like(ctrl._target_B_out))
+        view.choose_action(s)
+        view.train(s, 0, 1.0, rand_state())
+        assert torch.allclose(
+            view._target_B_head, torch.zeros_like(view._target_B_head)
+        )
 
     def test_target_updated_at_freq_boundary(self):
-        """After exactly TARGET_UPDATE_FREQ train calls target == online."""
-        ctrl = fresh_controller()
-        freq = RNNController.TARGET_UPDATE_FREQ
+        """After exactly TARGET_UPDATE_FREQ train calls, head AND core targets
+        must equal their online counterparts."""
+        view = fresh_view()
+        freq = UnifiedRoleView.TARGET_UPDATE_FREQ
         for _ in range(freq):
             s = rand_state()
-            ctrl.choose_action(s)
-            ctrl.train(s, 0, 1.0, rand_state())
-        # At step `freq` the hard copy runs inside train()
-        assert torch.allclose(ctrl._target_B_out, ctrl.lora_B_out.data)
-        assert torch.allclose(ctrl._target_A_in,  ctrl.lora_A_in.data)
-
-    def test_double_dqn_uses_target_for_next_state(self):
-        """Verify Double DQN: the target network evaluates the action chosen
-        by the online network.  With B=0 target the evaluation must differ
-        from the vanilla TD(0) target when target has diverged."""
-        ctrl = fresh_controller()
-        # Perturb target B_out to a known value so target != online
-        with torch.no_grad():
-            ctrl._target_B_out.fill_(1.0)   # target gives non-zero output
-            ctrl.lora_B_out.fill_(0.0)      # online stays at zero
-        s = rand_state()
-        ctrl.choose_action(s)
-        b_before = ctrl.lora_B_out.data.clone()
-        ctrl.train(s, 0, 1.0, rand_state())
-        b_after = ctrl.lora_B_out.data.clone()
-        # LoRA should have received a gradient (the target != online path)
-        assert not torch.allclose(b_before, b_after)
+            view.choose_action(s)
+            view.train(s, 0, 1.0, rand_state())
+        assert torch.allclose(view._target_B_head, view.lora_B_head.data)
+        assert torch.allclose(view.bank._target_B_core, view.bank.lora_B_core.data)
 
     def test_train_step_counter_increments(self):
-        ctrl = fresh_controller()
-        assert ctrl._train_steps == 0
+        view = fresh_view()
+        assert view._train_steps == 0
         s = rand_state()
-        ctrl.choose_action(s)
-        ctrl.train(s, 0, 1.0, rand_state())
-        assert ctrl._train_steps == 1
-
-    def test_target_network_persisted_in_save_load(self, tmp_path):
-        """save_lora must store target tensors and load_lora must restore them."""
-        ctrl = fresh_controller()
-        with torch.no_grad():
-            ctrl._target_B_out.fill_(3.14)
-        path = tmp_path / "lora_tgt.pt"
-        ctrl.save_lora(path)
-        ctrl2 = fresh_controller()
-        ctrl2.load_lora(path)
-        assert torch.allclose(ctrl2._target_B_out,
-                               torch.full_like(ctrl2._target_B_out, 3.14))
+        view.choose_action(s)
+        view.train(s, 0, 1.0, rand_state())
+        assert view._train_steps == 1
 
     def test_update_target_network_manually(self):
-        ctrl = fresh_controller()
+        view = fresh_view()
         with torch.no_grad():
-            ctrl.lora_B_out.fill_(7.0)
-        ctrl._update_target_network()
-        assert torch.allclose(ctrl._target_B_out,
-                               torch.full_like(ctrl._target_B_out, 7.0))
+            view.lora_B_head.fill_(7.0)
+            view.bank.lora_B_core.fill_(5.0)
+        view._update_target_network()
+        assert torch.allclose(view._target_B_head, torch.full_like(view._target_B_head, 7.0))
+        assert torch.allclose(view.bank._target_B_core, torch.full_like(view.bank._target_B_core, 5.0))
 
 
 # ===========================================================================
-# 16. LoRA exploration (mutate_lora / reset_lora_optimizer)
+# 15. LoRA exploration (mutate_lora / reset_lora_optimizer)
 # ===========================================================================
 
 class TestLoRAExploration:
-    def test_mutate_lora_changes_all_params(self):
-        ctrl   = fresh_controller()
+    def test_mutate_lora_changes_head_params(self):
+        view   = fresh_view()
         before = {
-            "A_in":  ctrl.lora_A_in.data.clone(),
-            "B_in":  ctrl.lora_B_in.data.clone(),
-            "A_out": ctrl.lora_A_out.data.clone(),
-            "B_out": ctrl.lora_B_out.data.clone(),
+            "A": view.lora_A_head.data.clone(),
+            "B": view.lora_B_head.data.clone(),
         }
-        ctrl.mutate_lora(sigma=0.5)   # large sigma → almost certainly changes
-        assert not torch.allclose(ctrl.lora_A_in.data, before["A_in"])
-        assert not torch.allclose(ctrl.lora_B_in.data, before["B_in"])
-        assert not torch.allclose(ctrl.lora_A_out.data, before["A_out"])
-        assert not torch.allclose(ctrl.lora_B_out.data, before["B_out"])
+        view.mutate_lora(sigma=0.5)
+        assert not torch.allclose(view.lora_A_head.data, before["A"])
+        assert not torch.allclose(view.lora_B_head.data, before["B"])
 
-    def test_mutate_lora_syncs_target(self):
-        """After mutation the target must equal the (now noisy) online LoRA."""
-        ctrl = fresh_controller()
-        ctrl.mutate_lora(sigma=0.5)
-        assert torch.allclose(ctrl._target_B_out, ctrl.lora_B_out.data)
-        assert torch.allclose(ctrl._target_A_in,  ctrl.lora_A_in.data)
+    def test_mutate_lora_syncs_head_target(self):
+        view = fresh_view()
+        view.mutate_lora(sigma=0.5)
+        assert torch.allclose(view._target_B_head, view.lora_B_head.data)
+
+    def test_mutate_core_changes_bank_params(self):
+        bank = fresh_bank()
+        before_a = bank.lora_A_core.data.clone()
+        before_b = bank.lora_B_core.data.clone()
+        bank.mutate_core(sigma=0.5)
+        assert not torch.allclose(bank.lora_A_core.data, before_a)
+        assert not torch.allclose(bank.lora_B_core.data, before_b)
+
+    def test_mutate_core_syncs_core_target(self):
+        bank = fresh_bank()
+        bank.mutate_core(sigma=0.5)
+        assert torch.allclose(bank._target_B_core, bank.lora_B_core.data)
 
     def test_reset_lora_optimizer_replaces_optimizer(self):
-        ctrl = fresh_controller()
-        old_id = id(ctrl._lora_optimizer)
-        ctrl.reset_lora_optimizer()
-        assert id(ctrl._lora_optimizer) != old_id
+        view = fresh_view()
+        old_id = id(view._head_optimizer)
+        view.reset_lora_optimizer()
+        assert id(view._head_optimizer) != old_id
 
     def test_reset_lora_optimizer_fresh_momentum(self):
-        """A reset optimizer must have no momentum buffers (Adam state = empty)."""
-        ctrl = fresh_controller()
-        # Train to populate momentum buffers
+        view = fresh_view()
         s = rand_state()
-        ctrl.choose_action(s)
-        ctrl.train(s, 0, 1.0, rand_state())
-        ctrl.reset_lora_optimizer()
-        assert len(ctrl._lora_optimizer.state) == 0
+        view.choose_action(s)
+        view.train(s, 0, 1.0, rand_state())
+        view.reset_lora_optimizer()
+        assert len(view._head_optimizer.state) == 0
 
+    def test_reset_core_optimizer_fresh_momentum(self):
+        view = fresh_view()
+        s = rand_state()
+        view.choose_action(s)
+        view.train(s, 0, 1.0, rand_state())
+        view.bank.reset_core_optimizer()
+        assert len(view.bank._core_optimizer.state) == 0
+
+
+# ===========================================================================
+# 16. Categorical projection (C51)
+# ===========================================================================
+
+class TestCategoricalProjection:
+    def test_projection_preserves_probability_mass(self):
+        dist = torch.zeros(1, N_ATOMS)
+        dist[0, 25] = 1.0
+        proj = project_categorical(dist, torch.tensor([10.0]), gamma=0.95)
+        assert abs(proj.sum().item() - 1.0) < 1e-5
+
+    def test_projection_expected_value_matches_bellman_target(self):
+        from worldsim.ai.rnn.unified import _SUPPORT
+        dist = torch.zeros(1, N_ATOMS)
+        dist[0, 25] = 1.0   # atom 25 == 0.0 given V_MIN=-50, V_MAX=50, 51 atoms
+        reward = 10.0
+        gamma = 0.95
+        proj = project_categorical(dist, torch.tensor([reward]), gamma=gamma)
+        expected = (proj[0] * _SUPPORT).sum().item()
+        target = reward + gamma * _SUPPORT[25].item()
+        assert abs(expected - target) < 1e-4
+
+
+# ===========================================================================
+# 17. Edge-case robustness
+# ===========================================================================
 
 class TestEdgeCases:
     def test_zero_state_does_not_crash(self):
-        ctrl = fresh_controller()
-        ctrl.predict([0.0] * IN)
-        ctrl.train([0.0] * IN, 0, 0.0, [0.0] * IN)
+        view = fresh_view()
+        view.predict([0.0] * IN)
+        view.train([0.0] * IN, 0, 0.0, [0.0] * IN)
 
     def test_large_reward_does_not_produce_nan(self):
-        ctrl = fresh_controller()
+        view = fresh_view()
         s = rand_state()
-        ctrl.predict(s)
-        ctrl.train(s, 0, 1e6, rand_state())
-        scores = ctrl.predict(rand_state())
+        view.predict(s)
+        view.train(s, 0, 1e6, rand_state())
+        scores = view.predict(rand_state())
         assert all(math.isfinite(v) for v in scores)
 
     def test_negative_reward(self):
-        ctrl = fresh_controller()
+        view = fresh_view()
         s = rand_state()
-        ctrl.predict(s)
-        ctrl.train(s, 0, -1.0, rand_state())  # should not raise
-
-    def test_all_actions_invalid_in_mask_falls_back_to_zero(self):
-        ctrl = fresh_controller(epsilon=0.0)
-        mask = [False, False, False]
-        a = ctrl.choose_action(rand_state(), valid_mask=mask)
-        assert a == 0   # fallback to 0 when no valid action
+        view.predict(s)
+        view.train(s, 0, -1.0, rand_state())

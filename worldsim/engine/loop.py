@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 from ..ai.representations import build_alliance_matrix
-from ..ai.rnn import step_all_base_models as _rnn_step_base_models
+from ..ai.rnn import step_trunk as _rnn_step_base_models
 from ..core import flags, time_limit, vprint
 from ..core.parallel import pooled_map, shutdown_pool
 from ..diplomacy import (
