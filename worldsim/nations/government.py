@@ -13,7 +13,7 @@ from .construction import RESOURCE_COSTS
 
 if TYPE_CHECKING:
     from .nation import Nation
-    from ..culture import Culture
+    from ..society.culture import Culture
 
 
 @dataclass(slots=True)
@@ -27,7 +27,7 @@ class Government:
 
     def update_weights(self, culture: "Culture") -> None:
         """Recompute archetype weights from culture trait proximity."""
-        from ..culture import ARCHETYPE_IDEALS
+        from ..society.culture import ARCHETYPE_IDEALS
 
         distances = {}
         culture_vec = list(culture.asdict().values())
