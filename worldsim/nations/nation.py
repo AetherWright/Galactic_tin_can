@@ -220,6 +220,11 @@ class Nation:
     # per role it uses) — ``None`` when torch is unavailable, in which case
     # every *_ai attribute above is a legacy (non-torch) controller instead.
     _unified_bank: Optional[Any] = field(default=None, repr=False)
+    # This nation's batched ground-division LoRA bank (see
+    # worldsim.ai.rnn.divisions.DivisionLoRABank) — None when torch is
+    # unavailable, in which case each Division falls back to its own tiny
+    # legacy posture/movement perceptron pair.
+    _division_bank: Optional[Any] = field(default=None, repr=False)
     action_queue: List[int] = field(default_factory=list)
     inbox: List[Message] = field(default_factory=list)
     leader_model: LeaderModel = field(default_factory=LeaderModel)
@@ -265,7 +270,9 @@ class Nation:
                 TorchDoctrineAI,
                 TorchEventAI,
                 UnifiedLoRABank,
+                DivisionLoRABank,
             )
+            from ..military.divisions import DIVISION_N_INPUTS, DIVISION_N_ACTIONS
             _use_torch = rnn_available()
         except Exception:  # ImportError or anything else
             _use_torch = False
@@ -273,6 +280,7 @@ class Nation:
         if _use_torch:
             bank = UnifiedLoRABank(core_state_fn=self.unified_core_state)
             self._unified_bank = bank
+            self._division_bank = DivisionLoRABank(DIVISION_N_INPUTS, DIVISION_N_ACTIONS)
             self.military_ai  = TorchWarAI(
                 allies_dim=ally_dim, table_path=military_path, bank=bank,
             )
@@ -574,6 +582,9 @@ class Nation:
             if self._unified_bank is not None:
                 self._unified_bank.mutate_core(sigma=0.02)
                 self._unified_bank.reset_core_optimizer()
+            if self._division_bank is not None:
+                self._division_bank.mutate_lora(sigma=0.02)
+                self._division_bank.reset_optimizer()
             _CTRL_ATTRS = (
                 "civilian_ai", "military_ai", "project_ai",
                 "diplomacy_ai", "doctrine_ai", "events_ai",

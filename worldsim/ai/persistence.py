@@ -446,6 +446,14 @@ def merge_and_save_models(
     except Exception:
         pass
 
+    # --- torch division trunk (shared batched ground-division network) ---
+    try:
+        from .rnn import rnn_available, save_division_trunk
+        if rnn_available():
+            save_division_trunk(seed_dir / "torch_division_trunk.pt")
+    except Exception:
+        pass
+
     # --- GA seed ---
     _save_ga_seed(nations, seed_dir / "seed_ga.json")
 
@@ -523,6 +531,17 @@ def load_model_seeds(
     except Exception:
         pass
 
+    # --- torch division trunk ---
+    try:
+        from .rnn import rnn_available, load_division_trunk
+        from ..military.divisions import DIVISION_N_INPUTS, DIVISION_N_ACTIONS
+        division_trunk_path = seed_dir / "torch_division_trunk.pt"
+        if rnn_available() and division_trunk_path.exists():
+            load_division_trunk(division_trunk_path, DIVISION_N_INPUTS, DIVISION_N_ACTIONS)
+            loaded = True
+    except Exception:
+        pass
+
     # --- GA seed ---
     ga_path = seed_dir / "seed_ga.json"
     try:
@@ -553,6 +572,7 @@ def _collect_ai_controllers(nation: Nation) -> Dict[str, object]:
         "diplomacy": nation.diplomacy_ai,
         "events":    nation.events_ai,
         "core":      nation._unified_bank,
+        "divisions": nation._division_bank,
     }
     return {name: ctrl for name, ctrl in controllers.items() if ctrl is not None}
 

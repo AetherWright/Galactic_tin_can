@@ -107,6 +107,14 @@ if _TORCH_AVAILABLE:
         TorchResearchSubsystemAI,
         TorchWarAI,
     )
+    from .divisions import (
+        DivisionLoRABank,
+        DivisionTrunkModel,
+        get_division_trunk,
+        load_division_trunk,
+        save_division_trunk,
+        step_division_trunk,
+    )
 else:
     # -----------------------------------------------------------------------
     # Stubs — imported safely when torch is absent
@@ -124,6 +132,8 @@ else:
     TorchDoctrineAI        = None   # type: ignore[assignment,misc]
     TorchFleetController   = None   # type: ignore[assignment,misc]
     TorchEventAI           = None   # type: ignore[assignment,misc]
+    DivisionLoRABank       = None   # type: ignore[assignment,misc]
+    DivisionTrunkModel     = None   # type: ignore[assignment,misc]
 
     def get_trunk(*_a: object, **_kw: object) -> None:   # type: ignore[return]
         return None
@@ -135,6 +145,18 @@ else:
         pass
 
     def load_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def get_division_trunk(*_a: object, **_kw: object) -> None:   # type: ignore[return]
+        return None
+
+    def step_division_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def save_division_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def load_division_trunk(*_a: object, **_kw: object) -> None:
         pass
 
 

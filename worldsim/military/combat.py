@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import random
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ..ai.representations import build_alliance_matrix, galactic_control_layers
 from ..core import distance, wprint
 from ..planets import PLANETS
 from .divisions import (
     Division,
+    NONCOMBAT_ORDERS,
+    apply_passive_order_effects,
+    compute_division_reward,
+    decide_division_actions,
+    division_projection_snapshot,
     move_division,
     reward_divisions,
+    train_division_batch,
     _apply_city_casualties,
 )
 from .logistics import (
@@ -28,12 +34,16 @@ if TYPE_CHECKING:
 
 def issue_orders(
     nation: "Nation", alliance_row: List[int] | None = None
-) -> None:
-    """Assign attack/defend/reserve orders to each division.
+) -> Optional[Tuple[List[float], int]]:
+    """Assign a WarAI attack/defend recommendation to each division.
 
-    Reads ``nation.doctrine_signal`` (set by :class:`DoctrineAI` at the end
-    of the previous fifth) and applies doctrine-level overrides on top of the
-    ``WarAI``'s tactical recommendation:
+    This is now only an *advisory* signal — :func:`~worldsim.military.divisions.decide_division_actions`
+    (called per-enemy from :func:`wage_war`) makes the division's actual,
+    richer decision and has the final say over ``div.order``, folding this
+    recommendation in as one input feature (see ``build_division_state``'s
+    ``prior_attack``). Reads ``nation.doctrine_signal`` (set by
+    :class:`DoctrineAI` at the end of the previous fifth) and applies
+    doctrine-level overrides on top of the ``WarAI``'s recommendation:
 
     * ``total_war``        → all divisions attack regardless of WarAI
     * ``strategic_reserve`` → all divisions stand down (reserve)
@@ -43,10 +53,14 @@ def issue_orders(
 
     The spatial grid and alliance row inputs are unchanged from the original
     implementation so the WarAI's weights remain compatible.
+
+    Returns the ``(state, action)`` pair for the last division processed (or
+    ``None`` if there were none), so :func:`wage_war` can finally train the
+    WarAI itself once the fifth's combat outcome is known.
     """
 
     if not nation.military_ai:
-        return
+        return None
 
     # Doctrine signal written by DoctrineAI (end of previous process_turn).
     # Use getattr so nations without the field still work.
@@ -73,13 +87,14 @@ def issue_orders(
             row.extend([0.0] * (allies_dim - len(row)))
         ally_features = [float(v) for v in row]
 
+    last: Optional[Tuple[List[float], int]] = None
     for div in nation.divisions:
         # Hard doctrine overrides — bypass WarAI entirely
         if doctrine == "total_war":
             div.order = "attack"
             continue
         if doctrine == "strategic_reserve":
-            div.order = "reserve"
+            div.order = "hold_reserve"
             continue
 
         # WarAI tactical recommendation
@@ -92,6 +107,7 @@ def issue_orders(
         state = base_features + ally_features + grid_features
         action = nation.military_ai.choose_action(state)
         raw_order = ["attack", "defend"][action]
+        last = (state, action)
 
         # Soft doctrine biases
         if doctrine == "defensive" and raw_order == "attack":
@@ -100,6 +116,7 @@ def issue_orders(
             div.order = "attack"   # offensive nations push forward
         else:
             div.order = raw_order
+    return last
 
 
 def wage_war(
@@ -130,7 +147,8 @@ def wage_war(
         matrix, _, index_map = build_alliance_matrix(nations)
         idx = index_map.get(nation.id)
         alliance_row = matrix[idx] if idx is not None else None
-    issue_orders(nation, alliance_row)
+    war_reward_before = nation.reward_snapshot()
+    last_war_state = issue_orders(nation, alliance_row)
     if (
         nation.nuclear_stockpile > 1
         and "Nuclear Weapons" in nation.tech_tree.unlocked
@@ -144,7 +162,7 @@ def wage_war(
         if not enemy:
             nation.at_war.discard(enemy_id)
             continue
-	
+
         loss_self = 0
         loss_enemy = 0
         engaged_self = 0.0
@@ -153,9 +171,22 @@ def wage_war(
         stacked_enemy = 0.0
         sup_self: List[Division] = []
         sup_enemy: List[Division] = []
-        for div in nation.divisions:
-            move_division(div, nation, enemy, nations)
+
+        proj_before_self  = division_projection_snapshot(nation)
+        proj_before_enemy = division_projection_snapshot(enemy)
+
+        # issue_orders(enemy) must run BEFORE decide_division_actions(enemy, ...) —
+        # it's only an advisory WarAI recommendation now (see issue_orders'
+        # docstring); decide_division_actions has the final say over div.order.
         issue_orders(enemy)
+
+        # Division decisions: a batched forward call scores every division a
+        # nation owns at once (torch), or each division's own tiny legacy
+        # perceptron pair decides (no torch) — see decide_division_actions.
+        decide_division_actions(nation, enemy, nations)
+        decide_division_actions(enemy, nation, nations)
+        for div in list(nation.divisions):
+            move_division(div, nation, enemy, nations)
         p1 = PLANETS.get(nation.planet)
         p2 = PLANETS.get(enemy.planet)
         if not p1 or not p2:
@@ -186,7 +217,7 @@ def wage_war(
             for div in n.divisions:
                 if div.planet != e.planet:
                     continue
-                if div.decide_posture() == "reserve":
+                if div.order in NONCOMBAT_ORDERS:
                     continue
                 dist_near = min(((div.x - c.x) ** 2 + (div.y - c.y) ** 2) ** 0.5 for c in e.cities)
                 if dist_near <= 100:
@@ -256,7 +287,13 @@ def wage_war(
                 total_nation_kills += kill
                 if div.soldiers <= 0 and div in nation.divisions:
                     nation.divisions.remove(div)
-            reward_divisions(sup_self, success)
+            if nation._division_bank is not None:
+                reward_self = compute_division_reward(
+                    success, proj_before_self, division_projection_snapshot(nation)
+                )
+                train_division_batch(nation, sup_self, reward_self)
+            else:
+                reward_divisions(sup_self, success)
 
         if sup_enemy:
             dispersal = 0.8 + 0.4 * min(1.5, defend_supply)
@@ -271,7 +308,16 @@ def wage_war(
                 total_enemy_kills += kill
                 if div.soldiers <= 0 and div in enemy.divisions:
                     enemy.divisions.remove(div)
-            reward_divisions(sup_enemy, -success)
+            if enemy._division_bank is not None:
+                reward_enemy = compute_division_reward(
+                    -success, proj_before_enemy, division_projection_snapshot(enemy)
+                )
+                train_division_batch(enemy, sup_enemy, reward_enemy)
+            else:
+                reward_divisions(sup_enemy, -success)
+
+        apply_passive_order_effects(nation)
+        apply_passive_order_effects(enemy)
 
         # Cascade division deaths into city populations (persistent loss)
         if total_nation_kills > 0:
@@ -320,4 +366,14 @@ def wage_war(
             enforce_victory(enemy, nation, nations)
         elif check_war_exhaustion(nation, enemy):
             make_peace(nation, enemy)
+
+    # WarAI was never trained anywhere before this — it only ever produced
+    # recommendations via choose_action(). Train it once per fifth here, now
+    # that this fifth's combat outcome (folded into reward_snapshot's
+    # military/stability/star/fleet deltas) is known.
+    if last_war_state is not None and nation.military_ai is not None:
+        war_state, war_action = last_war_state
+        war_reward_after = nation.reward_snapshot()
+        war_reward = nation.compute_reward(war_reward_before, war_reward_after)
+        nation.military_ai.train(war_state, war_action, war_reward, war_state)
 
