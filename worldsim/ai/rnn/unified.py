@@ -264,16 +264,6 @@ _REPLAY_LOCK = threading.Lock()
 _BATCH_SIZE: int = 128
 _GAMMA: float = 0.95
 
-# Every nation × role trains through the SAME shared trunk (core_proj / gru /
-# extra_proj / role_embedding / heads), unlike phase 1 where each role had
-# its own base model with its own lock. A single process-wide lock serialises
-# every backward pass through the trunk — per-nation locking isn't enough
-# once nations run their turns concurrently (worldsim.core.parallel.pooled_map),
-# since two different nations' threads would otherwise race on the same
-# shared parameters/gradients.
-_TRUNK_TRAIN_LOCK = threading.Lock()
-
-
 def add_experience(exp: _ReplayItem) -> None:
     with _REPLAY_LOCK:
         _REPLAY.append(exp)
@@ -455,26 +445,41 @@ class UnifiedRoleView:
         return torch.tensor(list(buf), dtype=torch.float32, device=_DEVICE).unsqueeze(0)
 
     def _forward(self, seq: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Online forward: core_proj+coreLoRA, extra_proj, role_embedding, gru, head+headLoRA."""
+        """Online forward: core_proj+coreLoRA, extra_proj, role_embedding, gru, head+headLoRA.
+
+        Every shared-trunk parameter is read through ``.detach()`` here — the
+        trunk (``core_proj``/``gru``/``extra_proj``/``role_embedding``/
+        ``heads``) is only ever trained separately, from the pooled replay
+        buffer, by :func:`step_trunk` on the main thread. Detaching means
+        ``loss.backward()`` in :meth:`train` only ever populates ``.grad`` on
+        this nation's own LoRA tensors, so concurrent nations' threads no
+        longer race on shared trunk gradients and don't need a lock around
+        their online training step.
+        """
         core_seq, extra_seq = self._split_seq(seq)
         T = core_seq.shape[1]
         core_flat = core_seq.reshape(T, CORE_DIM)
         extra_flat = extra_seq.reshape(T, self.n_inputs)
         scale = self.lora_alpha / self.lora_r
 
-        proj_core = F.linear(core_flat, self.trunk.core_proj.weight, self.trunk.core_proj.bias)
+        extra_layer = self.trunk.extra_proj[self.role]
+        head = self.trunk.heads[self.role]
+
+        proj_core = F.linear(
+            core_flat, self.trunk.core_proj.weight.detach(), self.trunk.core_proj.bias.detach()
+        )
         lora_core = (core_flat @ self.bank.lora_A_core.T) @ self.bank.lora_B_core.T * scale
         x = (
             proj_core + lora_core
-            + self.trunk.extra_proj[self.role](extra_flat)
-            + self.trunk.role_embedding[self.role]
+            + F.linear(extra_flat, extra_layer.weight.detach(), extra_layer.bias.detach())
+            + self.trunk.role_embedding[self.role].detach()
         ).unsqueeze(0)
 
-        gru_out, h_new = self.trunk.gru(x, h)
+        gru_params = {k: v.detach() for k, v in self.trunk.gru.named_parameters()}
+        gru_out, h_new = torch.func.functional_call(self.trunk.gru, gru_params, (x, h))
         last = gru_out[:, -1]
 
-        head = self.trunk.heads[self.role]
-        proj_head = F.linear(last, head.weight, head.bias)
+        proj_head = F.linear(last, head.weight.detach(), head.bias.detach())
         lora_head = (last @ self.lora_A_head.T) @ self.lora_B_head.T * scale
         out = proj_head + lora_head
         if self.categorical:
@@ -587,44 +592,38 @@ class UnifiedRoleView:
         reward_val = float(reward)
         h_ref = self._h
 
-        with _TRUNK_TRAIN_LOCK:
-            if self.categorical:
-                with torch.no_grad():
-                    next_online, _ = self._forward(next_seq, h_ref)
-                    next_probs_online = next_online.exp()
-                    expected_online = (next_probs_online * _SUPPORT).sum(dim=-1)
-                    best_next_act = int(expected_online.argmax(dim=1).item())
+        if self.categorical:
+            with torch.no_grad():
+                next_online, _ = self._forward(next_seq, h_ref)
+                next_probs_online = next_online.exp()
+                expected_online = (next_probs_online * _SUPPORT).sum(dim=-1)
+                best_next_act = int(expected_online.argmax(dim=1).item())
 
-                    next_target = self._forward_target(next_seq, h_ref)
-                    next_dist_target = next_target.exp()[:, best_next_act]
-                    reward_t = torch.tensor([reward_val], dtype=torch.float32, device=_DEVICE)
-                    target_dist = project_categorical(next_dist_target, reward_t, self.gamma)
+                next_target = self._forward_target(next_seq, h_ref)
+                next_dist_target = next_target.exp()[:, best_next_act]
+                reward_t = torch.tensor([reward_val], dtype=torch.float32, device=_DEVICE)
+                target_dist = project_categorical(next_dist_target, reward_t, self.gamma)
 
-                cur_out, _ = self._forward(cur_seq, h_ref)
-                log_p_a = cur_out[0, action]
-                loss = -(target_dist[0] * log_p_a).sum()
-            else:
-                with torch.no_grad():
-                    next_q_online, _ = self._forward(next_seq, h_ref)
-                    best_next_act = int(next_q_online.argmax(dim=1).item())
-                    next_q_target = self._forward_target(next_seq, h_ref)
-                    target_val = reward_val + self.gamma * float(next_q_target[0, best_next_act])
+            cur_out, _ = self._forward(cur_seq, h_ref)
+            log_p_a = cur_out[0, action]
+            loss = -(target_dist[0] * log_p_a).sum()
+        else:
+            with torch.no_grad():
+                next_q_online, _ = self._forward(next_seq, h_ref)
+                best_next_act = int(next_q_online.argmax(dim=1).item())
+                next_q_target = self._forward_target(next_seq, h_ref)
+                target_val = reward_val + self.gamma * float(next_q_target[0, best_next_act])
 
-                cur_q, _ = self._forward(cur_seq, h_ref)
-                target = cur_q.detach().clone()
-                target[0, action] = target_val
-                loss = F.mse_loss(cur_q, target)
+            cur_q, _ = self._forward(cur_seq, h_ref)
+            target = cur_q.detach().clone()
+            target[0, action] = target_val
+            loss = F.mse_loss(cur_q, target)
 
-            self.bank._core_optimizer.zero_grad()
-            self._head_optimizer.zero_grad()
-            loss.backward()
-            self.bank._core_optimizer.step()
-            self._head_optimizer.step()
-
-            # Base trunk (core_proj/gru/extra_proj/role_embedding/heads) is
-            # trained separately from the pooled replay buffer — zero its
-            # gradients here so this per-nation step doesn't also nudge it.
-            self.trunk.zero_grad()
+        self.bank._core_optimizer.zero_grad()
+        self._head_optimizer.zero_grad()
+        loss.backward()
+        self.bank._core_optimizer.step()
+        self._head_optimizer.step()
 
         self._train_steps += 1
         if self._train_steps % self.TARGET_UPDATE_FREQ == 0:

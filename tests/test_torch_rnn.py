@@ -447,14 +447,26 @@ class TestTrainingLoop:
         )
 
     def test_trunk_grads_zeroed_after_train(self):
-        """After train(), no grad should linger on trunk parameters."""
+        """train() must not introduce or alter any trunk-parameter gradient —
+        the online step only ever backprops into this nation's own LoRA
+        tensors. (Not a global-zero check: the trunk is a process-wide
+        singleton, so other tests' step_trunk() calls may leave unrelated
+        residual grads on it — train() just must not add to or change that.)
+        """
         view = fresh_view()
         state = rand_state()
         view.choose_action(state)
+        before = {
+            id(p): (p.grad.clone() if p.grad is not None else None)
+            for p in view.trunk.parameters()
+        }
         view.train(state, 0, 1.0, rand_state())
         for p in view.trunk.parameters():
-            if p.grad is not None:
-                assert torch.all(p.grad == 0), "trunk grad not zeroed"
+            prior = before[id(p)]
+            if prior is None:
+                assert p.grad is None, "train() introduced a new trunk gradient"
+            else:
+                assert torch.equal(p.grad, prior), "train() modified an existing trunk gradient"
 
     def test_experience_deposited_in_replay_tagged_with_role(self):
         view = fresh_view()
@@ -754,7 +766,8 @@ class TestStepTrunk:
 class TestThreadSafety:
     def test_concurrent_train_no_exception(self):
         """Multiple nations (each its own bank) training concurrently must
-        not raise — the shared trunk train() path is globally lock-serialised."""
+        not raise — the online train() step reads the shared trunk through
+        detached tensors, so no lock is needed to serialise it."""
         role = _unique_role()
         n_threads  = 8
         n_steps    = 15
@@ -805,6 +818,19 @@ class TestThreadSafety:
         # Within the deque's cap, exactly n_threads*n_steps new entries.
         assert n_after - n_before <= n_threads * n_steps
         assert n_after >= n_before
+
+    def test_train_does_not_touch_trunk_gradients(self):
+        """The online train() step must only ever populate .grad on this
+        nation's own LoRA tensors — never on the shared trunk's parameters.
+        That's what lets concurrent nations train without a shared lock."""
+        role = _unique_role()
+        view = fresh_view(role=role, epsilon=0.0)
+        for p in view.trunk.parameters():
+            p.grad = None
+        s = rand_state()
+        view.train(s, 0, 1.0, rand_state())
+        for p in view.trunk.parameters():
+            assert p.grad is None
 
 
 # ===========================================================================
