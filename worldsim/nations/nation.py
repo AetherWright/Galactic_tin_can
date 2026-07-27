@@ -155,7 +155,15 @@ class Nation:
     stability: float = 80.0
     resilience: float = 0.0
     infrastructure: float = 30.0
-    territory: int = 100
+    # Claimed land area (used by _can_add_city's border-radius check).
+    # Nothing else ever grows this — see the per-turn growth added in
+    # process_turn() — so it must start large enough on its own for a
+    # nation to ever add a *second* city. Colonies on a home planet
+    # (100x100, see galaxy.genesis) sit ~30+ units apart, and the border
+    # check is a circle of radius sqrt(territory/pi) around the nation's
+    # city centroid; the old default of 100 (radius ~5.6) put every
+    # colony out of reach, so build_city() silently no-opped forever.
+    territory: float = 6000.0
     planet: str = "Earth"
     relations: Dict[int, str] = field(init=False)
     alliances: Set[int] = field(default_factory=set)
@@ -833,6 +841,17 @@ class Nation:
         stab_flat = gov_bonuses.get("stability", 0.0)
         self.stability = max(0.0, min(self.stability + stab_flat * 0.1 + random.uniform(-0.5, 1), 100.0))
         self.technology.advance(self.economy, research_bonus)
+
+        # Territorial expansion: settlements gradually claim more land as
+        # infrastructure develops, capped at the home planet's actual area.
+        # This is what lets build_city() ever find a colony back within
+        # borders as the nation grows (see _can_add_city) — without it,
+        # territory would sit frozen at its starting value forever.
+        if planet is not None:
+            max_territory = float(planet.width * planet.height)
+            if self.territory < max_territory:
+                growth = 0.5 * self.infrastructure * (1 + len(self.cities))
+                self.territory = min(max_territory, self.territory + growth)
 
         self.government.approval += (self.stability - 50) / 100
         self.government.approval = max(0.0, min(self.government.approval, 100.0))

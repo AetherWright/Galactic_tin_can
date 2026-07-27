@@ -396,6 +396,32 @@ class TestPersistence:
             "torch_trunk.pt not created by merge_and_save_models"
         )
 
+    def test_merge_and_save_models_clears_replay_buffers(self, tmp_path):
+        """merge_and_save_models must wipe the shared replay buffers (training
+        scratch space, not learned state) before writing a checkpoint."""
+        from worldsim.ai.persistence import merge_and_save_models
+        from worldsim.ai.rnn.divisions import _REPLAY as DIVISION_REPLAY
+
+        nations = make_world()
+        for n in nations.values():
+            n.process_turn(nations)
+        assert len(_REPLAY) > 0, "expected some replay data before saving"
+        merge_and_save_models(nations, tmp_path)
+        assert len(_REPLAY) == 0
+        assert len(DIVISION_REPLAY) == 0
+
+    def test_merge_and_save_models_resets_hidden_state(self, tmp_path):
+        """merge_and_save_models must reset every role view's transient GRU
+        hidden state so a loaded nation doesn't resume mid-context."""
+        from worldsim.ai.persistence import merge_and_save_models
+
+        nations = make_world()
+        n = list(nations.values())[0]
+        view = civ_overseer(n)
+        view._h = torch.ones(1, 1, view._h.shape[-1])
+        merge_and_save_models(nations, tmp_path)
+        assert torch.all(view._h == 0), "hidden state not reset before save"
+
     def test_ga_seed_written(self, tmp_path):
         """seed_ga.json must always be written."""
         from worldsim.ai.persistence import merge_and_save_models

@@ -95,6 +95,7 @@ if _TORCH_AVAILABLE:
         save_trunk,
         step_trunk,
     )
+    from .unified import clear_replay as clear_unified_replay
     from .roles import (
         TorchCivilianOverseer,
         TorchDepartmentAI,
@@ -115,6 +116,7 @@ if _TORCH_AVAILABLE:
         save_division_trunk,
         step_division_trunk,
     )
+    from .divisions import clear_replay as clear_division_replay
 else:
     # -----------------------------------------------------------------------
     # Stubs — imported safely when torch is absent
@@ -157,6 +159,12 @@ else:
         pass
 
     def load_division_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def clear_unified_replay() -> None:
+        pass
+
+    def clear_division_replay() -> None:
         pass
 
 

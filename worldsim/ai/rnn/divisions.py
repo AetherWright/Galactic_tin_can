@@ -133,6 +133,13 @@ def _add_experience(exp: _ReplayItem) -> None:
         _REPLAY.append(exp)
 
 
+def clear_replay() -> None:
+    """Drop every buffered division transition. Call before persisting a
+    run's models — training scratch space, not learned state."""
+    with _REPLAY_LOCK:
+        _REPLAY.clear()
+
+
 def step_division_trunk(n_steps: int = 4) -> None:
     """Run *n_steps* SGD updates on the shared division trunk from the replay.
 

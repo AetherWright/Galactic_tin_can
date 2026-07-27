@@ -160,10 +160,18 @@ class UnifiedTrunkModel(nn.Module):
         extra_dim = max(1, extra_dim)
         new_params: List[nn.Parameter] = []
         if role not in self.extra_proj or self._extra_dim.get(role) != extra_dim:
+            was_resize = role in self._extra_dim and self._extra_dim[role] != extra_dim
             layer = nn.Linear(extra_dim, HIDDEN_DIM).to(_DEVICE)
             self.extra_proj[role] = layer
             self._extra_dim[role] = extra_dim
             new_params.extend(layer.parameters())
+            if was_resize:
+                # Every buffered replay entry for this role was recorded at
+                # the *previous* extra width (e.g. TorchWarAI.set_allies_dimension
+                # changing "war"'s width as nations are added/removed) — now
+                # incompatible with the just-updated self._extra_dim[role],
+                # which would crash step_trunk()'s reshape on the next call.
+                _purge_replay_for_role(role)
         if role not in self.role_embedding:
             emb = nn.Parameter(torch.zeros(HIDDEN_DIM, device=_DEVICE))
             self.role_embedding[role] = emb
@@ -267,6 +275,29 @@ _GAMMA: float = 0.95
 def add_experience(exp: _ReplayItem) -> None:
     with _REPLAY_LOCK:
         _REPLAY.append(exp)
+
+
+def clear_replay() -> None:
+    """Drop every buffered experience (up to :data:`_REPLAY_CAP` = 16 000
+    entries). Call before persisting a run's models — this is training
+    scratch space, not learned state, and there's no reason to keep it (or
+    the RAM it holds) alive across a checkpoint."""
+    with _REPLAY_LOCK:
+        _REPLAY.clear()
+
+
+def _purge_replay_for_role(role: str) -> None:
+    """Drop every buffered replay entry for *role*.
+
+    Called from :meth:`UnifiedTrunkModel.ensure_role` when a role's shared
+    ``extra_proj`` is resized — every entry buffered before the resize was
+    recorded at the previous (now incompatible) extra width, and
+    :func:`step_trunk` reshaping them against the new width would crash.
+    """
+    with _REPLAY_LOCK:
+        kept = [item for item in _REPLAY if item[0] != role]
+        _REPLAY.clear()
+        _REPLAY.extend(kept)
 
 
 def step_trunk(n_steps: int = 4) -> None:
@@ -422,6 +453,23 @@ class UnifiedRoleView:
         self._h: torch.Tensor = torch.zeros(1, 1, HIDDEN_DIM, device=_DEVICE)
         combined_dim = CORE_DIM + n_inputs
         self._buffer: Deque[List[float]] = deque(
+            [[0.0] * combined_dim] * BUFFER_SIZE, maxlen=BUFFER_SIZE
+        )
+
+    def reset_runtime_state(self) -> None:
+        """Zero this role's transient GRU hidden state and rolling buffer.
+
+        Neither is *learned* state — the hidden state is just recent
+        context carried between calls, and the buffer is the last
+        :data:`BUFFER_SIZE` observed inputs. Call this before persisting a
+        nation (see ``worldsim.ai.persistence``) so a checkpoint doesn't
+        needlessly bloat with per-nation runtime tensors, and so a nation
+        loaded from that checkpoint starts fresh rather than resuming
+        mid-context from wherever the previous run happened to stop.
+        """
+        self._h = torch.zeros(1, 1, HIDDEN_DIM, device=_DEVICE)
+        combined_dim = CORE_DIM + self.n_inputs
+        self._buffer = deque(
             [[0.0] * combined_dim] * BUFFER_SIZE, maxlen=BUFFER_SIZE
         )
 
@@ -647,6 +695,14 @@ class UnifiedRoleView:
     # ------------------------------------------------------------------
 
     def save_lora(self, path: Path) -> None:
+        """Persist the *learned* LoRA weights only.
+
+        Deliberately excludes the GRU hidden state and rolling input buffer
+        (see :meth:`reset_runtime_state`) — those are transient runtime
+        context, not learned parameters, so a loaded nation always starts
+        from a clean hidden state rather than resuming mid-context from
+        wherever the saving run happened to stop.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -655,7 +711,6 @@ class UnifiedRoleView:
                 "lora_B_head": self.lora_B_head.data,
                 "target_A_head": self._target_A_head,
                 "target_B_head": self._target_B_head,
-                "h": self._h,
                 "train_steps": self._train_steps,
             },
             path,
@@ -679,8 +734,6 @@ class UnifiedRoleView:
         ):
             if key in sd and sd[key].shape == getattr(self, tname).shape:
                 setattr(self, tname, sd[key].to(_DEVICE).clone())
-        if "h" in sd:
-            self._h = sd["h"]
         if "train_steps" in sd:
             self._train_steps = int(sd["train_steps"])
 
@@ -762,6 +815,14 @@ class UnifiedLoRABank:
         self._core_optimizer = optim.Adam(
             [self.lora_A_core, self.lora_B_core], lr=self._lr_lora
         )
+
+    def reset_runtime_state(self) -> None:
+        """Zero the transient GRU hidden state/rolling buffer for every role
+        view this nation owns — see
+        :meth:`UnifiedRoleView.reset_runtime_state`. Call before persisting
+        (see ``worldsim.ai.persistence``)."""
+        for view in self.roles.values():
+            view.reset_runtime_state()
 
     def save_core(self, path: Path) -> None:
         path = Path(path)

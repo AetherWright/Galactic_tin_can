@@ -268,6 +268,41 @@ class TestSharedReplay:
         add_experience(("role_that_does_not_exist_anywhere", buf, 0, 1.0, buf))
         step_trunk(n_steps=1)   # should not raise
 
+    def test_resizing_a_role_purges_its_stale_replay_entries(self):
+        """Resizing a role's extra width (e.g. TorchWarAI.set_allies_dimension
+        as nations are added/removed) must drop that role's previously
+        buffered entries — they were recorded at the old width and would
+        otherwise crash step_trunk's reshape against the new one."""
+        role = _unique_role()
+        trunk = get_trunk()
+        trunk.ensure_role(role, 10, OUT)
+        old_buf = [[0.2] * (CORE_DIM + 10)] * BUFFER_SIZE
+        for i in range(_BATCH_SIZE + 5):
+            add_experience((role, old_buf, i % OUT, 1.0, old_buf))
+        assert any(item[0] == role for item in _REPLAY)
+
+        trunk.ensure_role(role, 11, OUT)  # resize — width actually changes
+
+        assert not any(item[0] == role for item in _REPLAY), (
+            "stale-width replay entries survived a role resize"
+        )
+        step_trunk(n_steps=1)  # must not raise on the new width
+
+    def test_resizing_a_role_does_not_purge_other_roles(self):
+        role_a = _unique_role("role_a")
+        role_b = _unique_role("role_b")
+        trunk = get_trunk()
+        trunk.ensure_role(role_a, 10, OUT)
+        trunk.ensure_role(role_b, 12, OUT)
+        buf_b = [[0.3] * (CORE_DIM + 12)] * BUFFER_SIZE
+        add_experience((role_b, buf_b, 0, 1.0, buf_b))
+
+        trunk.ensure_role(role_a, 20, OUT)  # resize role_a only
+
+        assert any(item[0] == role_b for item in _REPLAY), (
+            "unrelated role's replay entries were wrongly purged"
+        )
+
 
 # ===========================================================================
 # 4. UnifiedRoleView — rolling buffer, hidden state
@@ -561,6 +596,39 @@ class TestPersistence:
     def test_load_lora_nonexistent_path_is_no_op(self, tmp_path):
         view = fresh_view()
         view.load_lora(tmp_path / "does_not_exist.lora.pt")  # should not raise
+
+    def test_save_lora_does_not_persist_hidden_state(self, tmp_path):
+        """Hidden state is transient runtime context, not learned — a saved
+        checkpoint must not carry it, and a loaded view must start clean
+        regardless of what the saving view's hidden state was."""
+        view = fresh_view()
+        view._h = torch.ones_like(view._h)
+        path = tmp_path / "lora.pt"
+        view.save_lora(path)
+
+        view2 = fresh_view()
+        view2._h = torch.full_like(view2._h, 7.0)
+        view2.load_lora(path)
+        assert torch.all(view2._h == 7.0), (
+            "load_lora must not touch hidden state — it isn't saved"
+        )
+
+    def test_reset_runtime_state_zeroes_hidden_and_buffer(self):
+        view = fresh_view()
+        view._h = torch.ones_like(view._h)
+        view.reset_runtime_state()
+        assert torch.all(view._h == 0)
+        assert all(v == 0.0 for row in view._buffer for v in row)
+
+    def test_bank_reset_runtime_state_resets_every_role(self):
+        bank = fresh_bank()
+        v1 = fresh_view(bank=bank)
+        v2 = fresh_view(bank=bank)
+        v1._h = torch.ones_like(v1._h)
+        v2._h = torch.ones_like(v2._h)
+        bank.reset_runtime_state()
+        assert torch.all(v1._h == 0)
+        assert torch.all(v2._h == 0)
 
     def test_save_table_creates_lora_file(self, tmp_path):
         ai = TorchDiplomacyAI(epsilon=0.0)

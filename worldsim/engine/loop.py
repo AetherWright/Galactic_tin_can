@@ -244,10 +244,18 @@ def run_simulation(
     except TimeoutError:
         vprint("Maximum runtime reached; stopping simulation.")
     finally:
+        # Both cleanup steps must run on every exit path, including an
+        # unhandled exception propagating out of _one_century() — previously
+        # these ran *after* the try/finally, so a mid-run crash (native
+        # extension fault, torch error, etc.) skipped shutdown_pool()
+        # entirely, orphaning the multiprocessing.Pool's semaphores (the
+        # "leaked semaphore objects" resource_tracker warning at exit).
         if console_ui:
             console_ui.close()
-    engine.save_qtables()
-    shutdown_pool()
+        try:
+            engine.save_qtables()
+        finally:
+            shutdown_pool()
 
 
 class SimulationLoop:

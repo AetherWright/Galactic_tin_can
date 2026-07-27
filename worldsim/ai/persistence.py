@@ -33,6 +33,47 @@ from .meta_ga import RewardGA
 
 
 # ---------------------------------------------------------------------------
+# Transient RNN state — wiped before every checkpoint
+# ---------------------------------------------------------------------------
+
+def _wipe_transient_ai_state(nations: Dict[int, Nation]) -> None:
+    """Clear per-nation GRU hidden state/rolling buffers and the shared
+    replay buffers before writing a checkpoint.
+
+    None of this is *learned* state (the learned weights are the trunk
+    params and LoRA tensors, saved separately) — it's runtime scratch space
+    that only grows the process's live tensor count the longer a run goes,
+    with no reason to carry it into a saved checkpoint. Clearing it here
+    keeps peak memory down during the save itself and means a nation loaded
+    from this checkpoint always starts from a clean hidden state instead of
+    resuming mid-context from wherever this run happened to stop.
+    """
+    try:
+        from .rnn import rnn_available, clear_unified_replay, clear_division_replay
+    except Exception:
+        return
+    if not rnn_available():
+        return
+    for nation in nations.values():
+        bank = getattr(nation, "_unified_bank", None)
+        if bank is not None:
+            try:
+                bank.reset_runtime_state()
+            except Exception:
+                pass
+    clear_unified_replay()
+    clear_division_replay()
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Role → attribute-name mapping for NelderMeadPolicy-based controllers
 # ---------------------------------------------------------------------------
 
@@ -400,6 +441,8 @@ def merge_and_save_models(
     seed_dir = Path(seed_dir)
     seed_dir.mkdir(parents=True, exist_ok=True)
 
+    _wipe_transient_ai_state(nations)
+
     # --- per-role NelderMeadPolicy seeds ---
     for role, attr in _ROLE_TO_ATTR.items():
         # The civilian AI is a hierarchical CivilianController, not a flat
@@ -584,6 +627,7 @@ def _save_ai_tables(nations: Dict[int, Nation], directory: Path) -> Dict[str, Di
     """
     manifest: Dict[str, Dict[str, str]] = {}
     directory.mkdir(parents=True, exist_ok=True)
+    _wipe_transient_ai_state(nations)
     for nation in nations.values():
         controllers = _collect_ai_controllers(nation)
         if not controllers:
