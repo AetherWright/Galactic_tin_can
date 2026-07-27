@@ -473,6 +473,33 @@ class UnifiedRoleView:
             [[0.0] * combined_dim] * BUFFER_SIZE, maxlen=BUFFER_SIZE
         )
 
+    def _sync_extra_dim(self) -> None:
+        """Rebuild the rolling buffer if the shared trunk's extra width for
+        this role has drifted since we last built it.
+
+        Only "war" (``TorchWarAI``, whose ally-count-driven width changes as
+        nations are created/destroyed via ``set_allies_dimension``) resizes
+        at runtime — but the trunk's ``extra_proj[role]`` is one process-wide
+        layer shared by every nation using that role. When *another* nation
+        resizes it, this role view's own ``self.n_inputs``/``self._buffer``
+        don't change — its next forward pass would otherwise try to combine
+        a stale-width buffered sequence with the trunk's new-width layer and
+        crash. Called at the top of every entry point that touches the
+        buffer, so any nation's role view self-heals regardless of which
+        other nation triggered the resize or when.
+        """
+        current = self.trunk.extra_dim(self.role)
+        if current != self.n_inputs:
+            self.n_inputs = current
+            # Rebuild the buffer only — the hidden state's shape (always
+            # [1, 1, HIDDEN_DIM]) doesn't depend on extra width, and
+            # set_allies_dimension has never reset it on its own resizes
+            # either, so there's no reason to discard it here.
+            combined_dim = CORE_DIM + current
+            self._buffer = deque(
+                [[0.0] * combined_dim] * BUFFER_SIZE, maxlen=BUFFER_SIZE
+            )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -582,6 +609,7 @@ class UnifiedRoleView:
 
     def predict(self, extra: Sequence[float]) -> List[float]:
         """Forward pass; returns one raw score (or expected value) per action."""
+        self._sync_extra_dim()
         combined = self._combined(extra)
         self._buffer.append(combined)
         seq = self._buf_to_tensor(self._buffer)
@@ -629,6 +657,7 @@ class UnifiedRoleView:
         if not (0 <= action < self.n_outputs):
             return
 
+        self._sync_extra_dim()
         cur_buf = list(self._buffer)
         next_combined = self._combined(next_extra)
         next_buf_deq: Deque[List[float]] = deque(self._buffer, maxlen=BUFFER_SIZE)

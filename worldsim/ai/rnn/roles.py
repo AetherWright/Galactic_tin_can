@@ -63,13 +63,27 @@ class TorchWarAI(_TableRoleView):
         bank: Optional[UnifiedLoRABank] = None,
     ) -> None:
         self.grid_size          = max(1, grid_size)
-        self.allies_dim         = max(1, allies_dim)
         self.grid_feature_count = self.grid_size * self.grid_size * 2
-        n_inputs = 4 + self.allies_dim + self.grid_feature_count
+        resolved_allies_dim     = max(1, allies_dim)
+        n_inputs = 4 + resolved_allies_dim + self.grid_feature_count
         super().__init__(
             bank or _standalone_bank(), "war", n_inputs, 2,
             table_path=table_path, epsilon=epsilon, gamma=gamma,
         )
+
+    @property
+    def allies_dim(self) -> int:
+        """Derived from ``self.n_inputs`` — never stored separately.
+
+        ``self.n_inputs`` can also change via
+        ``UnifiedRoleView._sync_extra_dim()`` (self-healing when *another*
+        nation's ``set_allies_dimension`` call resizes the shared
+        ``extra_proj["war"]`` layer this role view doesn't own). A
+        separately-tracked ``allies_dim`` attribute would silently drift out
+        of sync with ``n_inputs`` whenever that happens; deriving it instead
+        means there's only one source of truth.
+        """
+        return self.n_inputs - 4 - self.grid_feature_count
 
     def set_allies_dimension(self, allies_dim: int) -> None:
         """Rebuild the role's extra-feature width when the live nation count changes.
@@ -82,14 +96,12 @@ class TorchWarAI(_TableRoleView):
         allies_dim = max(1, allies_dim)
         if allies_dim == self.allies_dim:
             return
-        self.allies_dim = allies_dim
-        new_n = 4 + self.allies_dim + self.grid_feature_count
+        new_n = 4 + allies_dim + self.grid_feature_count
         self.n_inputs = new_n
         self.trunk.ensure_role("war", new_n, self.n_outputs)
         self._buffer = deque(
             [[0.0] * (CORE_DIM + new_n)] * BUFFER_SIZE, maxlen=BUFFER_SIZE
         )
-        self._h = self._h  # unchanged shape (HIDDEN_DIM); nothing to rebuild
 
     @staticmethod
     def create_doctrine() -> str:

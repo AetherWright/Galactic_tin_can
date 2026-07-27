@@ -717,6 +717,26 @@ class TestRoleWrappers:
             a = ai.choose_action(s)
             ai.train(s, a, 0.5, s)   # must not raise
 
+    def test_torch_war_ai_self_heals_after_another_nations_resize(self):
+        """Every nation's TorchWarAI shares one trunk-wide "war" extra_proj —
+        when ANOTHER nation's set_allies_dimension() resizes it, this one's
+        own choose_action()/train() must not crash on the now-stale width
+        (reproduces a real crash: issue_orders(enemy) — alliance_row=None —
+        and consider_first_strike() call choose_action() without ever
+        calling set_allies_dimension themselves)."""
+        war_a = TorchWarAI(allies_dim=4)
+        war_b = TorchWarAI(allies_dim=4)
+        state_a = rand_state(war_a.n_inputs)
+        war_a.choose_action(state_a)  # populate war_a's buffer at width 4
+
+        war_b.set_allies_dimension(7)  # a *different* nation resizes the shared layer
+        assert war_a.n_inputs != war_b.n_inputs  # war_a hasn't heard about it yet
+
+        action = war_a.choose_action(state_a)  # must not raise
+        assert 0 <= action < war_a.n_outputs
+        assert war_a.n_inputs == war_b.n_inputs, "war_a did not self-heal"
+        war_a.train(state_a, action, 0.5, state_a)  # must not raise either
+
     # ----- TorchDomesticPolicyAI -----
     def test_domestic_policy_ai_output_dim(self):
         ai = TorchDomesticPolicyAI(actions=21, n_inputs=20)

@@ -337,6 +337,11 @@ class SimulationLoop:
         self.century += 1
         if self.century % 20 == 0:
             _apply_great_filter(self.nations)
+        # run_simulation()'s _one_century has always culled zombie/runaway
+        # nation counts here; this class-based loop (used by the GUI/other
+        # embeddings) was missing the same safety net, so it — unlike the
+        # CLI path — had no ceiling on unbounded civil-war-driven nation growth.
+        _cull_zombie_nations(self.nations)
         for n in self.nations.values():
             n.step_meta(self.century)
 
