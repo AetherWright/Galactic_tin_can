@@ -114,12 +114,19 @@ class Division:
     equipment: float = 1.0
     template: str = "Infantry"
     doctrine: str = "Balanced"
-    controller: SimplePerceptron = field(
-        default_factory=lambda: make_perceptron(3, n_outputs=3)
-    )
-    movement_controller: SimplePerceptron = field(
-        default_factory=lambda: make_perceptron(6, n_outputs=3)
-    )
+    # Legacy per-division posture/movement perceptrons — only ever used by
+    # decide_posture()/decide_movement() (the no-torch fallback path in
+    # decide_division_actions). Lazily constructed on first actual use
+    # rather than eagerly here: when a torch division bank is available
+    # (the common case) these are never touched at all, so eagerly building
+    # one native (Rust/C++) perceptron per division per posture/movement
+    # head — via an FFI call, for every division ever created, including
+    # under concurrent civilian-AI threads building several divisions at
+    # once — is both wasted work and (empirically, via a native heap
+    # corruption crash during a long concurrent multi-nation run) a real
+    # stability risk this sidesteps entirely by simply not happening.
+    _controller: Optional[SimplePerceptron] = field(default=None, repr=False)
+    _movement_controller: Optional[SimplePerceptron] = field(default=None, repr=False)
     posture: str = "reserve"
     order: str = "reserve"
     in_transit: bool = False
@@ -127,6 +134,22 @@ class Division:
     # this fifth, kept only long enough for train_division_batch to consume.
     _last_state: Optional[List[float]] = None
     _last_action: Optional[int] = None
+
+    @property
+    def controller(self) -> SimplePerceptron:
+        """Posture perceptron — constructed on first use (see the field
+        comment above)."""
+        if self._controller is None:
+            self._controller = make_perceptron(3, n_outputs=3)
+        return self._controller
+
+    @property
+    def movement_controller(self) -> SimplePerceptron:
+        """Movement perceptron — constructed on first use (see the field
+        comment above)."""
+        if self._movement_controller is None:
+            self._movement_controller = make_perceptron(6, n_outputs=3)
+        return self._movement_controller
 
     def decide_posture(self, context=None) -> str:
         """Legacy per-division fallback (no torch): attack/defend/reserve."""

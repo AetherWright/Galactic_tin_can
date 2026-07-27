@@ -239,6 +239,18 @@ class DivisionLoRABank:
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self._rng = random.Random(seed)
+        # Unlike the unified trunk (detached during online training, so
+        # concurrent nations never touch each other's gradients — see
+        # UnifiedRoleView._forward), a nation's own division bank CAN be
+        # reached from another nation's thread: worldsim.military.combat's
+        # wage_war(nation, ...) calls decide_division_actions/train_division_batch
+        # on `enemy` too, and enemy's own wage_war may be running concurrently
+        # on its own thread. Two threads doing a real backward()+optimizer.step()
+        # (or a step() racing a forward read) on the same LoRA tensors crashes
+        # autograd's in-place version check, so this bank's own methods
+        # serialise access to its own tensors — this does not affect other
+        # nations' banks or the shared (lock-free) trunk itself.
+        self._lock = threading.Lock()
 
         self.trunk = get_division_trunk(n_inputs, n_actions)
 
@@ -318,7 +330,7 @@ class DivisionLoRABank:
         if not states:
             return []
         x = torch.tensor(list(states), dtype=torch.float32, device=_DEVICE)
-        with torch.no_grad():
+        with self._lock, torch.no_grad():
             scores = self._forward(x).tolist()
         actions: List[int] = []
         for i, row in enumerate(scores):
@@ -355,40 +367,42 @@ class DivisionLoRABank:
             dtype=torch.long, device=_DEVICE,
         )
 
-        with torch.no_grad():
-            next_q_online = self._forward(next_states_t)
-            best_next = next_q_online.argmax(dim=1)
-            next_q_target = self._forward_target(next_states_t)
-            next_val = next_q_target.gather(1, best_next.unsqueeze(1)).squeeze(1)
-            target = rewards_t + self.gamma * next_val
+        with self._lock:
+            with torch.no_grad():
+                next_q_online = self._forward(next_states_t)
+                best_next = next_q_online.argmax(dim=1)
+                next_q_target = self._forward_target(next_states_t)
+                next_val = next_q_target.gather(1, best_next.unsqueeze(1)).squeeze(1)
+                target = rewards_t + self.gamma * next_val
 
-        cur_q = self._forward(states_t)
-        pred = cur_q.gather(1, actions_t.unsqueeze(1)).squeeze(1)
-        loss = F.mse_loss(pred, target)
+            cur_q = self._forward(states_t)
+            pred = cur_q.gather(1, actions_t.unsqueeze(1)).squeeze(1)
+            loss = F.mse_loss(pred, target)
 
-        self._optimizer.zero_grad()
-        loss.backward()
-        self._optimizer.step()
+            self._optimizer.zero_grad()
+            loss.backward()
+            self._optimizer.step()
 
-        self._train_steps += 1
-        if self._train_steps % self.TARGET_UPDATE_FREQ == 0:
-            self._update_target_network()
+            self._train_steps += 1
+            if self._train_steps % self.TARGET_UPDATE_FREQ == 0:
+                self._update_target_network()
 
         with _REPLAY_LOCK:
             for state, action, reward, next_state in transitions:
                 _REPLAY.append((list(state), int(action), float(reward), list(next_state)))
 
     def mutate_lora(self, sigma: float = 0.02) -> None:
-        with torch.no_grad():
+        with self._lock, torch.no_grad():
             for p in (self.lora_A_in, self.lora_B_in, self.lora_A_out, self.lora_B_out):
                 p.data.add_(torch.randn_like(p.data) * sigma)
-        self._update_target_network()
+            self._update_target_network()
 
     def reset_optimizer(self) -> None:
-        self._optimizer = optim.Adam(
-            [self.lora_A_in, self.lora_B_in, self.lora_A_out, self.lora_B_out],
-            lr=self._lr_lora,
-        )
+        with self._lock:
+            self._optimizer = optim.Adam(
+                [self.lora_A_in, self.lora_B_in, self.lora_A_out, self.lora_B_out],
+                lr=self._lr_lora,
+            )
 
     # ------------------------------------------------------------------
     # Persistence

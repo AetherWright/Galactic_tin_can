@@ -198,6 +198,37 @@ class TestConcurrentTraining:
             t.join()
         assert not errors
 
+    def test_same_bank_trained_from_two_threads_no_exception(self):
+        """Regression test: worldsim.military.combat.wage_war(nation, ...)
+        trains BOTH nation's and its enemy's division bank, and both sides'
+        wage_war run concurrently on separate threads (worldsim.core.parallel
+        pooled_map mode="thread") — so the *same* bank can get train_batch()
+        called from two different nation threads at once. Before the
+        per-bank lock this crashed with a RuntimeError from autograd's
+        in-place version check (two concurrent backward+optimizer.step()
+        calls racing on the same LoRA tensors)."""
+        import threading
+
+        bank = fresh_bank()
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                for _ in range(50):
+                    states = [rand_state() for _ in range(4)]
+                    actions = bank.choose_actions(states)
+                    transitions = [(s, a, 1.0, s) for s, a in zip(states, actions)]
+                    bank.train_batch(transitions)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, f"Exceptions from concurrent same-bank training: {errors}"
+
 
 # ===========================================================================
 # 4. Persistence
@@ -319,6 +350,39 @@ class TestActionSpace:
     def test_power_multiplier_default_is_one(self):
         div = make_division(order="attack")
         assert div.power == pytest.approx(div.soldiers * div.experience * div.equipment)
+
+
+class TestLazyLegacyControllers:
+    """Division.controller/movement_controller (native Rust/C++ perceptrons,
+    the no-torch fallback) must never be constructed eagerly — only when the
+    legacy decide_posture/decide_movement path actually runs. Constructing
+    them for every division regardless of whether torch is available was
+    both wasted FFI work and, empirically, a heap-corruption crash risk
+    under concurrent construction across nation threads."""
+
+    def test_not_constructed_on_division_creation(self):
+        div = make_division()
+        assert div._controller is None
+        assert div._movement_controller is None
+
+    def test_not_constructed_by_batched_torch_decision(self):
+        bank = fresh_bank()
+        divisions = [make_division() for _ in range(4)]
+        nation = _FakeNation(divisions=divisions)
+        nation._division_bank = bank
+        enemy = _FakeNation(planet="Mars", cities=[_FakeCity("Mars")])
+        decide_division_actions(nation, enemy, {})
+        for div in divisions:
+            assert div._controller is None
+            assert div._movement_controller is None
+
+    def test_lazily_constructed_on_first_legacy_use(self):
+        div = make_division()
+        div.decide_posture()
+        assert div._controller is not None
+        assert div._movement_controller is None
+        div.decide_movement([0.0] * 6)
+        assert div._movement_controller is not None
 
 
 class TestBuildDivisionState:
