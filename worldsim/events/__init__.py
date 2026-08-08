@@ -4,7 +4,9 @@ Submodules
 ----------
 ``catalog``    static flavour events
 ``generator``  situation-aware procedural event generation
-``qlearner``   contextual Q-table learning event responses
+``qlearner``   legacy per-event tabular Q-learning (no-torch fallback only —
+               see ``worldsim.ai.rnn.roles.TorchEventAI`` for the shared
+               categorical agent used when torch is available)
 ``engine``     trigger probability, choice resolution and persistence
 """
 

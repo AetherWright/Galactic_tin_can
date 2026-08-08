@@ -66,6 +66,7 @@ def update_border_pressure(
                 1.0 if other.id in nation.alliances else 0.0,
             ]
             act = nation.diplomacy_ai.choose_action(state)
+            reward_before = nation.reward_snapshot()
 
             if act == 1 and other.id not in nation.alliances and other.id not in nation.at_war:
                 # Form alliance — also establish trade partnership
@@ -94,7 +95,7 @@ def update_border_pressure(
                 nation.stability / 100.0,
                 1.0 if other.id in nation.alliances else 0.0,
             ]
-            reward = nation.compute_reward("diplomacy", state, new_state)
+            reward = nation.compute_reward(reward_before, nation.reward_snapshot())
             nation.diplomacy_ai.train(state, act, reward, new_state)
 
     # Border pressure bleeds stability

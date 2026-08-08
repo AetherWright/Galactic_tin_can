@@ -1,18 +1,18 @@
-"""Event engine with contextual Q-learning and heuristic fallback.
+"""Event engine with categorical Q-learning and heuristic fallback.
 
-Each :class:`EventDecisionEngine` instance carries an
-:class:`~worldsim.events.qlearner.EventQLearner` that learns nation-context →
-action mappings across the lifetime of a simulation run.  Q-tables are
-persisted to YAML files at run end and reloaded the next time the engine
-starts, enabling progressive improvement across runs.
+Each nation's ``events_ai`` (a shared, LoRA-specialised categorical C51
+agent — see :class:`worldsim.ai.rnn.roles.TorchEventAI`) learns nation-state
+→ choice mappings, replacing what used to be a separate hand-rolled Q-table
+per event name. When torch is unavailable ``events_ai`` is ``None`` and this
+engine falls back to its own legacy :class:`~worldsim.events.qlearner.EventQLearner`
+(per-event tabular Q-learning, persisted to YAML files at run end).
 
 Design notes
 ------------
-* State is coarsely bucketed (economy × stability × at_war) to keep tables
-  compact while still capturing the most important decision context.
-* When no Q-data exists for an (event, state) pair the engine falls back to
-  static heuristic scoring, so first-run behaviour is sensible.
-* Memory is updated every event regardless of the ``collect`` flag so the
+* When neither learner has data for the current (event, state) pair the
+  engine falls back to static heuristic scoring, so first-run behaviour is
+  sensible.
+* Training happens every event regardless of the ``collect`` flag so the
   learner improves even in summary-only mode.
 """
 
@@ -165,11 +165,14 @@ class EventDecisionEngine:
         return score
 
     def _choose_option(self, nation, event: str, options: List[Dict]) -> int:
-        """Pick the best option, consulting the Q-learner first.
+        """Pick the best option, consulting the nation's event agent first.
 
-        When the Q-learner has data for the current (event, state) pair it
-        takes precedence (with epsilon-greedy exploration).  Otherwise the
-        heuristic scorer is used as a sensible default.
+        Prefers the shared categorical (C51) agent on ``nation.events_ai``
+        (LoRA-specialised per nation, same as every other directorate).
+        When torch is unavailable that attribute is ``None`` and the engine
+        falls back to the legacy per-event tabular ``EventQLearner``.
+        Absent any learned data, the heuristic scorer is used as a sensible
+        default.
         """
         if not options:
             return 0
@@ -179,6 +182,11 @@ class EventDecisionEngine:
             )
             if rust_choice is not None:
                 return rust_choice
+        events_ai = getattr(nation, "events_ai", None)
+        if events_ai is not None:
+            mask = [i < len(options) for i in range(events_ai.n_outputs)]
+            idx = events_ai.choose_action(self._state_snapshot(nation), mask)
+            return max(0, min(idx, len(options) - 1))
         q_choice = self.q_learner.choose(nation, event, len(options))
         if q_choice is not None:
             return q_choice
@@ -246,7 +254,14 @@ class EventDecisionEngine:
         idx: int,
         collect: bool,
     ):
-        """Apply the selected option’s effects, train the Q-learner, and return."""
+        """Apply the selected option's effects, train the event agent, and return.
+
+        ``state``/``next_state`` (the network's observation) stay the
+        engine's own ``_state_snapshot``; the reward is computed separately
+        from ``Nation.reward_snapshot()`` before/after — see
+        :meth:`~worldsim.nations.nation.Nation.compute_reward` for why the
+        two are decoupled.
+        """
         if not options:
             return None
         idx = max(0, min(idx, len(options) - 1))
@@ -254,25 +269,36 @@ class EventDecisionEngine:
         choice  = selection.get("choice", "")
         effects = selection.get("effects", {})
 
-        before = self._state_snapshot(nation)
+        state = self._state_snapshot(nation)
+        reward_before = (
+            nation.reward_snapshot() if hasattr(nation, "reward_snapshot") else state
+        )
         self.apply_effects(nation, effects, event)
-        after  = self._state_snapshot(nation)
+        next_state = self._state_snapshot(nation)
+        reward_after = (
+            nation.reward_snapshot() if hasattr(nation, "reward_snapshot") else next_state
+        )
 
         # Compute reward regardless of collect — needed for Q-learning.
         if hasattr(nation, "compute_reward"):
             try:
-                reward = float(nation.compute_reward("events", before, after))
+                reward = float(nation.compute_reward(reward_before, reward_after))
             except Exception:
-                reward = sum(a - b for a, b in zip(after, before))
+                reward = sum(a - b for a, b in zip(next_state, state))
         else:
-            reward = sum(a - b for a, b in zip(after, before))
+            reward = sum(a - b for a, b in zip(next_state, state))
 
-        # Always update the Q-learner so it learns from every event.
-        self.q_learner.update(nation, event, idx, reward, len(options))
+        # Train the nation's shared categorical event agent when available;
+        # otherwise fall back to the legacy per-event tabular EventQLearner.
+        events_ai = getattr(nation, "events_ai", None)
+        if events_ai is not None:
+            events_ai.train(state, idx, reward, next_state)
+        else:
+            self.q_learner.update(nation, event, idx, reward, len(options))
         # Mirror the transition into the rust_events table when the bridge is
         # active, so both backends learn from the same history.
         if self.rust_bridge is not None and self.rust_bridge.alive:
-            self.rust_bridge.update(event, before, idx, reward, after)
+            self.rust_bridge.update(event, state, idx, reward, next_state)
 
         if collect:
             return {
@@ -281,8 +307,8 @@ class EventDecisionEngine:
                 "choice_index": idx,
                 "choice":      choice,
                 "effects":     effects,
-                "state_before": before,
-                "state_after":  after,
+                "state_before": state,
+                "state_after":  next_state,
                 "reward":      reward,
             }
         return f"{event}: {choice}"

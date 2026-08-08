@@ -33,6 +33,47 @@ from .meta_ga import RewardGA
 
 
 # ---------------------------------------------------------------------------
+# Transient RNN state — wiped before every checkpoint
+# ---------------------------------------------------------------------------
+
+def _wipe_transient_ai_state(nations: Dict[int, Nation]) -> None:
+    """Clear per-nation GRU hidden state/rolling buffers and the shared
+    replay buffers before writing a checkpoint.
+
+    None of this is *learned* state (the learned weights are the trunk
+    params and LoRA tensors, saved separately) — it's runtime scratch space
+    that only grows the process's live tensor count the longer a run goes,
+    with no reason to carry it into a saved checkpoint. Clearing it here
+    keeps peak memory down during the save itself and means a nation loaded
+    from this checkpoint always starts from a clean hidden state instead of
+    resuming mid-context from wherever this run happened to stop.
+    """
+    try:
+        from .rnn import rnn_available, clear_unified_replay, clear_division_replay
+    except Exception:
+        return
+    if not rnn_available():
+        return
+    for nation in nations.values():
+        bank = getattr(nation, "_unified_bank", None)
+        if bank is not None:
+            try:
+                bank.reset_runtime_state()
+            except Exception:
+                pass
+    clear_unified_replay()
+    clear_division_replay()
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Role → attribute-name mapping for NelderMeadPolicy-based controllers
 # ---------------------------------------------------------------------------
 
@@ -41,8 +82,8 @@ _ROLE_TO_ATTR: Dict[str, str] = {
     "civilian":  "civilian_ai",
     "projects":  "project_ai",
     "diplomacy": "diplomacy_ai",
-    "research":  "research_ai",
     "doctrine":  "doctrine_ai",
+    "events":    "events_ai",
 }
 
 
@@ -347,36 +388,25 @@ def _apply_fleet_seed(controller, payload: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _save_ga_seed(nations: Dict[int, Nation], path: Path) -> None:
-    """Save merged GA weights to JSON."""
-    all_keys: set = set()
-    for n in nations.values():
-        all_keys.update(n.reward_ga.keys())
-    info: Dict = {"reward_ga": {}, "leader": []}
-    for key in all_keys:
-        gas  = [n.reward_ga[key] for n in nations.values() if key in n.reward_ga]
-        info["reward_ga"][key] = _merge_weights(gas)
-    info["leader"] = _merge_weights([n.leader_model.ga for n in nations.values()])
+    """Save merged leader/culture GA weights to JSON.
+
+    (Directorate reward weighting is no longer GA-evolved — see
+    ``Nation.compute_reward`` — so only the unrelated ``LeaderModel`` culture
+    GA is seeded here now.)
+    """
+    info: Dict = {"leader": _merge_weights([n.leader_model.ga for n in nations.values()])}
     with open(path, "w", encoding="utf8") as fh:
         json.dump(info, fh)
 
 
 def _apply_ga_seed(nations: Dict[int, Nation], path: Path) -> None:
-    """Inject merged GA weights into all nations’ reward GAs."""
+    """Inject merged leader/culture GA weights into all nations."""
     if not path.exists():
         return
     with open(path, encoding="utf8") as fh:
         data = json.load(fh)
-    reward_ga    = data.get("reward_ga", {})
-    leader_w     = data.get("leader", [])
+    leader_w = data.get("leader", [])
     for nation in nations.values():
-        for key, weights in reward_ga.items():
-            if key not in nation.reward_ga:
-                continue
-            ga    = nation.reward_ga[key]
-            n_w   = ga.length
-            seeded = (list(weights) + [1.0] * n_w)[:n_w]
-            for genome in ga.population:
-                genome.weights = list(seeded)
         if leader_w and hasattr(nation, "leader_model"):
             n_w = nation.leader_model.ga.length
             lw  = (list(leader_w) + [1.0] * n_w)[:n_w]
@@ -410,6 +440,8 @@ def merge_and_save_models(
         return     # pragma: no cover
     seed_dir = Path(seed_dir)
     seed_dir.mkdir(parents=True, exist_ok=True)
+
+    _wipe_transient_ai_state(nations)
 
     # --- per-role NelderMeadPolicy seeds ---
     for role, attr in _ROLE_TO_ATTR.items():
@@ -447,13 +479,21 @@ def merge_and_save_models(
         with open(seed_dir / "seed_fleet.yml", "w", encoding="utf8") as fh:
             _yaml.safe_dump(fleet_payload, fh, default_flow_style=False)
 
-    # --- torch RNN base models (shared backbone per role × dims) ---
+    # --- torch unified trunk (shared across every role/nation) ---
     # The PyTorch controllers don't fit the NelderMead seed format; persist
-    # their shared base models as a directory of .pt checkpoints instead.
+    # the shared trunk as its own checkpoint instead.
     try:
-        from .rnn import rnn_available, save_all_base_models
+        from .rnn import rnn_available, save_trunk
         if rnn_available():
-            save_all_base_models(seed_dir / "torch_bases")
+            save_trunk(seed_dir / "torch_trunk.pt")
+    except Exception:
+        pass
+
+    # --- torch division trunk (shared batched ground-division network) ---
+    try:
+        from .rnn import rnn_available, save_division_trunk
+        if rnn_available():
+            save_division_trunk(seed_dir / "torch_division_trunk.pt")
     except Exception:
         pass
 
@@ -524,12 +564,23 @@ def load_model_seeds(
         except OSError:
             pass
 
-    # --- torch RNN base models ---
+    # --- torch unified trunk ---
     try:
-        from .rnn import rnn_available, load_all_base_models
-        bases_dir = seed_dir / "torch_bases"
-        if rnn_available() and bases_dir.exists():
-            load_all_base_models(bases_dir)
+        from .rnn import rnn_available, load_trunk
+        trunk_path = seed_dir / "torch_trunk.pt"
+        if rnn_available() and trunk_path.exists():
+            load_trunk(trunk_path)
+            loaded = True
+    except Exception:
+        pass
+
+    # --- torch division trunk ---
+    try:
+        from .rnn import rnn_available, load_division_trunk
+        from ..military.divisions import DIVISION_N_INPUTS, DIVISION_N_ACTIONS
+        division_trunk_path = seed_dir / "torch_division_trunk.pt"
+        if rnn_available() and division_trunk_path.exists():
+            load_division_trunk(division_trunk_path, DIVISION_N_INPUTS, DIVISION_N_ACTIONS)
             loaded = True
     except Exception:
         pass
@@ -551,13 +602,20 @@ def load_model_seeds(
 # ---------------------------------------------------------------------------
 
 def _collect_ai_controllers(nation: Nation) -> Dict[str, object]:
-    """Return all reinforcement controllers attached to *nation*."""
+    """Return all reinforcement controllers attached to *nation*.
+
+    ``"core"`` is the nation's shared unified-trunk LoRA bank (see
+    ``worldsim.ai.rnn.unified.UnifiedLoRABank``) — absent when torch is
+    unavailable, in which case every other entry is a legacy controller.
+    """
     controllers = {
         "military": nation.military_ai,
         "civilian": nation.civilian_ai,
         "projects": nation.project_ai,
         "diplomacy": nation.diplomacy_ai,
-        "research":  nation.research_ai,
+        "events":    nation.events_ai,
+        "core":      nation._unified_bank,
+        "divisions": nation._division_bank,
     }
     return {name: ctrl for name, ctrl in controllers.items() if ctrl is not None}
 
@@ -569,6 +627,7 @@ def _save_ai_tables(nations: Dict[int, Nation], directory: Path) -> Dict[str, Di
     """
     manifest: Dict[str, Dict[str, str]] = {}
     directory.mkdir(parents=True, exist_ok=True)
+    _wipe_transient_ai_state(nations)
     for nation in nations.values():
         controllers = _collect_ai_controllers(nation)
         if not controllers:
@@ -605,17 +664,9 @@ def save_gp_model(
         When omitted a folder named ``<path stem>_ai`` is created alongside
         ``path``.
     """
-    info: Dict[str, object] = {"reward_ga": {}, "leader": []}
-
-    all_keys: set = set()
-    for n in nations.values():
-        all_keys.update(n.reward_ga.keys())
-
-    for key in all_keys:
-        gas = [n.reward_ga[key] for n in nations.values() if key in n.reward_ga]
-        info["reward_ga"][key] = _merge_weights(gas)
-
-    info["leader"] = _merge_weights([n.leader_model.ga for n in nations.values()])
+    info: Dict[str, object] = {
+        "leader": _merge_weights([n.leader_model.ga for n in nations.values()])
+    }
 
     path = Path(path)
     ai_directory = Path(ai_dir).resolve() if ai_dir else path.parent / f"{path.stem}_ai"

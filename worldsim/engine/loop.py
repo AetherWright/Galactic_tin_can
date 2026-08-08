@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 from ..ai.representations import build_alliance_matrix
-from ..ai.rnn import step_all_base_models as _rnn_step_base_models
-from ..ai.rnn import sync_all_meta_ga as _rnn_sync_meta_ga
+from ..ai.rnn import step_trunk as _rnn_step_base_models
 from ..core import flags, time_limit, vprint
 from ..core.parallel import pooled_map, shutdown_pool
 from ..diplomacy import (
@@ -30,7 +29,6 @@ from .filters import (
 )
 from .politics import _handle_internal_conflicts
 from .reporting import _print_century_summary
-from .scoring import apply_century_scores
 from .territory import process_planets, update_star_ownership
 
 
@@ -141,13 +139,8 @@ def run_simulation(
                     human_events.extend(commands["events"])
             os.remove(control_path)
         _cull_zombie_nations(nations)
-        apply_century_scores(nations)
         for n in nations.values():
             n.step_meta(century)
-        # Push MetaGA fitness into every RNN controller so epsilon and
-        # reward-scale reflect the current genome's performance before the
-        # next set of simulation fifths begins.
-        _rnn_sync_meta_ga(nations)
 
         # Accumulate events across all 5 fifths; print summary once at the end.
         century_events: list = []
@@ -251,10 +244,18 @@ def run_simulation(
     except TimeoutError:
         vprint("Maximum runtime reached; stopping simulation.")
     finally:
+        # Both cleanup steps must run on every exit path, including an
+        # unhandled exception propagating out of _one_century() — previously
+        # these ran *after* the try/finally, so a mid-run crash (native
+        # extension fault, torch error, etc.) skipped shutdown_pool()
+        # entirely, orphaning the multiprocessing.Pool's semaphores (the
+        # "leaked semaphore objects" resource_tracker warning at exit).
         if console_ui:
             console_ui.close()
-    engine.save_qtables()
-    shutdown_pool()
+        try:
+            engine.save_qtables()
+        finally:
+            shutdown_pool()
 
 
 class SimulationLoop:
@@ -336,11 +337,13 @@ class SimulationLoop:
         self.century += 1
         if self.century % 20 == 0:
             _apply_great_filter(self.nations)
-        # Per-century MetaGA scoring (shared with run_simulation)
-        apply_century_scores(self.nations)
+        # run_simulation()'s _one_century has always culled zombie/runaway
+        # nation counts here; this class-based loop (used by the GUI/other
+        # embeddings) was missing the same safety net, so it — unlike the
+        # CLI path — had no ceiling on unbounded civil-war-driven nation growth.
+        _cull_zombie_nations(self.nations)
         for n in self.nations.values():
             n.step_meta(self.century)
-        _rnn_sync_meta_ga(self.nations)
 
         century_events: list = []
 

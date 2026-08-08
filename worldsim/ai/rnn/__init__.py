@@ -2,40 +2,39 @@
 
 Architecture
 ------------
-One GRU-based *base model* is shared across all nations for each AI *role*
-(war, civilian, project, diplomacy, research, doctrine, fleet).  Each nation
-additionally owns a lightweight *LoRA adapter* per role that specialises the
-shared backbone without touching its weights.
+**One shared GRU trunk** serves every AI role (war, civilian, project,
+diplomacy, research, doctrine, fleet, events) — see :mod:`.unified` for the
+full design. Every role's forward pass is built from two pieces:
+
+    combined input = core(16, shared) ++ extra(role-specific, unchanged)
+
+``core`` is :meth:`~worldsim.nations.nation.Nation.unified_core_state` — the
+same economy/stability/military/tech/infrastructure/population/star/fleet
+fields as ``reward_snapshot()``, NN-scaled, plus the nation's 8
+:class:`~worldsim.society.culture.Culture` traits, so every role's decision
+can condition on the nation's culture. ``extra`` is each role's own,
+already-tuned feature vector, completely unchanged from before unification.
+
+Each nation owns one :class:`~worldsim.ai.rnn.unified.UnifiedLoRABank`: a
+*core* LoRA adapter (shared across every role for that nation — this is
+where a nation's culture-driven personality lives) plus one small *head*
+LoRA per role it uses (specialises that role's specific action preferences).
+Neither the shared trunk's per-role ``extra_proj``/``role_embedding``/
+``heads`` nor the GRU itself are LoRA'd — those are nation-invariant and
+trained from a pooled replay buffer (:func:`~worldsim.ai.rnn.unified.step_trunk`,
+called once per century from the main simulation loop).
 
 Rolling input buffer
-    Every controller keeps a ``deque`` of the last :data:`BUFFER_SIZE`
-    (= 5) input vectors.  At each forward pass the full buffer is fed to the
-    GRU as a sequence, giving the model temporal context across simulation
-    steps.
-
-LoRA (Low-Rank Adaptation)
-    The adapter modifies the input-projection and output-projection layers of
-    the base GRU:
-
-        eff_W_in  = W_in  + (B_in  @ A_in)  * (alpha / r)
-        eff_W_out = W_out + (B_out @ A_out) * (alpha / r)
-
-    ``A`` matrices are kaiming-uniform-initialised; ``B`` matrices start at
-    zero, so the adapter has zero effect at initialisation and only diverges
-    from the base model as training proceeds.
+    Every role view keeps a ``deque`` of the last :data:`BUFFER_SIZE`
+    (= 5) combined (core++extra) vectors, fed to the GRU as a sequence.
 
 Training
-    *LoRA*: Updated on every :meth:`RNNController.train` call using TD(0) and
-    a per-nation Adam optimiser.  The backward pass is serialised through a
-    per-role lock so concurrent nation threads do not corrupt shared base
-    model parameter gradients.
+    Double DQN (scalar heads) or C51 categorical cross-entropy (the
+    ``events`` head) against a frozen *target* copy of the nation's LoRA,
+    hard-updated every ``TARGET_UPDATE_FREQ`` steps — same as phase 1, just
+    operating on the narrower LoRA surface described above.
 
-    *Base model*: Each train call stores the experience in a replay buffer
-    owned by the :class:`RoleBaseModel`.  Call
-    :func:`step_all_base_models` from the main (non-threaded) simulation
-    loop once per century to run gradient updates over the accumulated batch.
-
-Public API (matches the NelderMeadPolicy surface)
+Public API (unchanged from phase 1)
     ``predict(state) -> List[float]``
     ``predict_prob(state) -> List[float]``
     ``choose_action(state, valid_mask=None) -> int``
@@ -44,7 +43,22 @@ Public API (matches the NelderMeadPolicy surface)
 
 The package imports cleanly when PyTorch is missing: every public name is
 then bound to ``None`` (classes) or a no-op (functions) and
-:func:`rnn_available` returns ``False``.
+:func:`rnn_available` returns ``False`` — every role wrapper's caller falls
+back to its legacy (non-torch) implementation, same convention as always.
+
+History
+-------
+Phase 1 put every role on its own GRU trunk (one ``RoleBaseModel`` per role ×
+input-dim × output-dim) plus a categorical events agent, and unified the
+*reward function* (``Nation.compute_reward``/``reward_snapshot``) so every
+role shares one designed reward instead of a GA-evolved one per directorate.
+
+Phase 2 (this module) is the collapse those per-role trunks were designed to
+enable: one shared trunk, culture folded into the input every role sees, and
+the physics/engineering/biology research subsystems — previously still on
+their original legacy (non-torch) ``ResearchAI`` — brought onto the same
+unified trunk, retiring the dead, never-actually-called ``nation.research_ai``
+in the process.
 """
 from __future__ import annotations
 
@@ -68,62 +82,89 @@ _FLEET_STATE_LIST = [
 ]
 
 if _TORCH_AVAILABLE:
-    from .base import (
+    from .unified import (
         BUFFER_SIZE,
-        RoleBaseModel,
-        _BaseGRUModel,
-        _DOCTRINE_LIST,
-        _FLEET_STATE_LIST,
-        _REGISTRY,
-        _REGISTRY_LOCK,
-        _ROLE_GA_KEY,
-        get_role_model,
-        load_all_base_models,
-        save_all_base_models,
-        step_all_base_models,
-        sync_all_meta_ga,
+        CORE_DIM,
+        HIDDEN_DIM,
+        N_ATOMS,
+        UnifiedLoRABank,
+        UnifiedRoleView,
+        UnifiedTrunkModel,
+        get_trunk,
+        load_trunk,
+        save_trunk,
+        step_trunk,
     )
-    from .controller import RNNController
+    from .unified import clear_replay as clear_unified_replay
     from .roles import (
         TorchCivilianOverseer,
         TorchDepartmentAI,
         TorchDiplomacyAI,
         TorchDoctrineAI,
         TorchDomesticPolicyAI,
+        TorchEventAI,
         TorchFleetController,
         TorchProjectAI,
-        TorchResearchAI,
+        TorchResearchSubsystemAI,
         TorchWarAI,
     )
+    from .divisions import (
+        DivisionLoRABank,
+        DivisionTrunkModel,
+        get_division_trunk,
+        load_division_trunk,
+        save_division_trunk,
+        step_division_trunk,
+    )
+    from .divisions import clear_replay as clear_division_replay
 else:
     # -----------------------------------------------------------------------
     # Stubs — imported safely when torch is absent
     # -----------------------------------------------------------------------
-    RNNController          = None   # type: ignore[assignment,misc]
-    RoleBaseModel          = None   # type: ignore[assignment,misc]
+    UnifiedRoleView        = None   # type: ignore[assignment,misc]
+    UnifiedTrunkModel      = None   # type: ignore[assignment,misc]
+    UnifiedLoRABank        = None   # type: ignore[assignment,misc]
     TorchWarAI             = None   # type: ignore[assignment,misc]
     TorchDomesticPolicyAI  = None   # type: ignore[assignment,misc]
     TorchCivilianOverseer  = None   # type: ignore[assignment,misc]
     TorchDepartmentAI      = None   # type: ignore[assignment,misc]
     TorchProjectAI         = None   # type: ignore[assignment,misc]
     TorchDiplomacyAI       = None   # type: ignore[assignment,misc]
-    TorchResearchAI        = None   # type: ignore[assignment,misc]
+    TorchResearchSubsystemAI = None   # type: ignore[assignment,misc]
     TorchDoctrineAI        = None   # type: ignore[assignment,misc]
     TorchFleetController   = None   # type: ignore[assignment,misc]
+    TorchEventAI           = None   # type: ignore[assignment,misc]
+    DivisionLoRABank       = None   # type: ignore[assignment,misc]
+    DivisionTrunkModel     = None   # type: ignore[assignment,misc]
 
-    def get_role_model(*_a: object, **_kw: object) -> None:   # type: ignore[return]
+    def get_trunk(*_a: object, **_kw: object) -> None:   # type: ignore[return]
         return None
 
-    def step_all_base_models(*_a: object, **_kw: object) -> None:
+    def step_trunk(*_a: object, **_kw: object) -> None:
         pass
 
-    def sync_all_meta_ga(*_a: object, **_kw: object) -> None:
+    def save_trunk(*_a: object, **_kw: object) -> None:
         pass
 
-    def save_all_base_models(*_a: object, **_kw: object) -> None:
+    def load_trunk(*_a: object, **_kw: object) -> None:
         pass
 
-    def load_all_base_models(*_a: object, **_kw: object) -> None:
+    def get_division_trunk(*_a: object, **_kw: object) -> None:   # type: ignore[return]
+        return None
+
+    def step_division_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def save_division_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def load_division_trunk(*_a: object, **_kw: object) -> None:
+        pass
+
+    def clear_unified_replay() -> None:
+        pass
+
+    def clear_division_replay() -> None:
         pass
 
 

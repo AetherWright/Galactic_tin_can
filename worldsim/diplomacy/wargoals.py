@@ -174,6 +174,30 @@ def enforce_victory(
 # Ally war entry
 # ---------------------------------------------------------------------------
 
+#: Floor on the war-weariness multiplier (see _war_weariness_factor) — entry
+#: is dampened as more of the galaxy is already fighting, but never fully
+#: closed off even at maximum galaxy-wide conflict.
+_MIN_WAR_WEARINESS_FACTOR: float = 0.15
+
+
+def _war_weariness_factor(nations: Dict[int, "Nation"]) -> float:
+    """Return a [0.15..1.0] multiplier on ally war-entry chance that shrinks
+    as more of the galaxy is already at war.
+
+    Without this, every qualifying ally rolls the same flat
+    :data:`ALLY_WAR_ENTRY_CHANCE` regardless of how much of the galaxy is
+    already burning — so one war can chain through alliance webs into a
+    galaxy-wide conflagration at a constant rate. Scaling the chance down as
+    galaxy-wide conflict intensity rises makes remaining neutral nations
+    progressively more reluctant to pile on, which self-dampens cascades
+    instead of amplifying them.
+    """
+    if not nations:
+        return 1.0
+    at_war_fraction = sum(1 for n in nations.values() if n.at_war) / len(nations)
+    return max(_MIN_WAR_WEARINESS_FACTOR, 1.0 - at_war_fraction)
+
+
 def notify_ally_war_entry(
     nation:  "Nation",
     enemy:   "Nation",
@@ -184,8 +208,10 @@ def notify_ally_war_entry(
     An ally will enter the war if:
     * It is not already at war with anyone (avoid spreading too thin).
     * Its doctrine is not ``strategic_reserve`` or ``economic``.
-    * A random draw is below :data:`ALLY_WAR_ENTRY_CHANCE` (40 %).
+    * A random draw is below :data:`ALLY_WAR_ENTRY_CHANCE`, scaled down by
+      :func:`_war_weariness_factor` as more of the galaxy is already fighting.
     """
+    weariness = _war_weariness_factor(nations)
     for ally_id in list(nation.alliances):
         if ally_id == enemy.id:
             continue
@@ -198,7 +224,7 @@ def notify_ally_war_entry(
             continue   # already in a separate war — don't drag in
         if ally.doctrine_signal in ("strategic_reserve", "economic"):
             continue   # pacifist doctrine; stay out
-        if random.random() >= ALLY_WAR_ENTRY_CHANCE:
+        if random.random() >= ALLY_WAR_ENTRY_CHANCE * weariness:
             continue
         if ally.planet != enemy.planet:
             continue

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, Callable, TYPE_CHECKING
+from typing import Dict, Callable
 import random
 
 @dataclass(slots=True)
@@ -41,10 +41,6 @@ class Culture:
             val = getattr(self, name)
             val += random.uniform(-rate, rate)
             setattr(self, name, max(0.0, min(1.0, val)))
-
-
-if TYPE_CHECKING:  # pragma: no cover - import only for typing
-    from .models import Nation
 
 
 @dataclass

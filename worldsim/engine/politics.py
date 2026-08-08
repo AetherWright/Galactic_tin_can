@@ -13,6 +13,18 @@ from ..planets import PLANETS, City
 from ..society.culture import Culture
 
 
+# _handle_internal_conflicts runs once per *fifth* (5x/century — see
+# engine.loop). The raw (stability, cities, military) formula below can
+# reach ~1.0 at very low stability with no military to speak of; rolled 5
+# times a century with no ceiling, that's a near-certain civil war every
+# single fifth once a nation's stability crashes, which is exactly the kind
+# of runaway fragmentation (one bad century turning 4 nations into 150+)
+# this cap exists to prevent. 3% per fifth keeps the *cumulative* per-century
+# chance (5 independent rolls) around 14% even in the worst case — still a
+# real, meaningful risk, just not a near-certainty.
+_MAX_CIVIL_WAR_RISK_PER_FIFTH: float = 0.03
+
+
 def _spawn_rebel_nation(parent: Nation, nations: Dict[int, Nation], year: int) -> None:
     """Create a breakaway nation from *parent* during a civil war."""
 
@@ -29,9 +41,6 @@ def _spawn_rebel_nation(parent: Nation, nations: Dict[int, Nation], year: int) -
     nations[new_id] = rebel
     rebel.year_born = year
     rebel.last_collapse = year
-    for key, ga in parent.reward_ga.items():
-        rebel.reward_ga[key] = ga.clone()
-        rebel.reward_ga[key].mutate(0.15)
 
     for other in nations.values():
         if other.id == new_id:
@@ -81,6 +90,12 @@ def _spawn_rebel_nation(parent: Nation, nations: Dict[int, Nation], year: int) -
     parent.at_war.add(new_id)
     rebel.at_war.add(parent.id)
     rebel.economy_linear = parent.economy_linear * ratio
+    # The parent just lost cities/military/economy to this split and is
+    # already at war with its own breakaway state — without its own
+    # cooldown it could roll for (and lose) another chunk next fifth,
+    # compounding into runaway fragmentation. Give it the same grace
+    # period the rebel gets.
+    parent.last_collapse = year
     vprint(f"  {parent.name} erupts in civil war! {new_name} rebels.")
 
 
@@ -125,9 +140,6 @@ def _handle_internal_conflicts(nations: Dict[int, Nation], year: int) -> None:
         )
         new_nation.year_born = year
         new_nation.last_collapse = year
-        new_nation.reward_ga = {k: ga.clone() for k, ga in old.reward_ga.items()}
-        for ga in new_nation.reward_ga.values():
-            ga.mutate(0.05)
         nations[nid] = new_nation
         assign_initial_cities({nid: new_nation})
 
@@ -148,7 +160,7 @@ def _handle_internal_conflicts(nations: Dict[int, Nation], year: int) -> None:
             risk = (50 - nation.stability) / 50
             risk += 0.001 * min(len(nation.cities), 5)
             risk -= min(0.3, nation.military / 50)
-            risk = max(risk, 0.0)
+            risk = min(_MAX_CIVIL_WAR_RISK_PER_FIFTH, max(risk, 0.0))
         # Nations enjoy a 10-year grace period after collapsing
         years_since = year - nation.last_collapse
         if years_since < 10:

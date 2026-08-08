@@ -118,9 +118,10 @@ All numerical computation selects the fastest available backend at import time:
    (`SimplePerceptron` / `LayeredNetwork` run the same code vectorised on GPU)
 2. **NumPy** — CPU fallback with identical API
 3. **Rust / C++** — scalar hot-paths for logistic growth, polygon area/centroid,
-   distance; one-vs-rest perceptron banks (`rust_ai`, `cpp_ai`) backing the
-   per-division posture/movement controllers; the `rust_events` crate as an
-   opt-in event Q-table engine (`--rust-events`)
+   distance; one-vs-rest perceptron banks (`rust_ai`, `cpp_ai`) as the
+   legacy per-division posture/movement fallback when torch is unavailable
+   (see **Ground divisions** below for the torch-backed batched network);
+   the `rust_events` crate as an opt-in event Q-table engine (`--rust-events`)
 
 ### Memory-aware batching
 
@@ -306,6 +307,28 @@ Turn-by-turn spending is bounded by a **soft budget** (see below): once the
 budget for the turn is exhausted, remaining lower-priority departments stand
 down, though the single highest-priority action is always allowed so a
 nation with no money isn't fully paralysed.
+
+### Ground divisions
+
+Divisions don't fit the per-role GRU pattern above — they're numerous,
+short-lived, and stateless from one fifth to the next, so they get their own
+**shared, stateless, batched** feedforward network (`worldsim.ai.rnn.divisions`)
+instead: one forward call scores every division a nation owns at once, and
+one batched backward pass trains every transition from that fifth in a
+single step, rather than one perceptron update per division. Per-nation LoRA
+specialises the shared trunk the same way as every other role; the legacy
+Rust/C++/NumPy perceptron pair (posture + movement) is the fallback when
+torch is unavailable.
+
+Each division picks one of nine actions per fifth per enemy it faces:
+`attack`, `defend`, `hold_reserve`, `fortify`, `garrison_colony`, `raid`,
+`besiege`, `deploy_offworld`, `recall_home` — up from the original
+attack/defend/reserve (+ stay/deploy/recall) split across two separate
+perceptrons. Training combines the immediate combat outcome with a
+**colonial-capability / interstellar-force-projection bonus**: reward grows
+with the nation's owned star count, the fraction of its soldiers stationed
+off the homeworld, and how many divisions are actively garrisoning a colony
+(`worldsim.military.divisions.compute_division_reward`).
 
 ### Soft economic budget
 

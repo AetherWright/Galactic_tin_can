@@ -34,17 +34,16 @@ from worldsim.ai.rnn import (
     TorchDepartmentAI,
     TorchProjectAI,
     TorchDiplomacyAI,
-    TorchResearchAI,
+    TorchResearchSubsystemAI,
     TorchDoctrineAI,
     TorchFleetController,
-    RoleBaseModel,
-    step_all_base_models,
-    save_all_base_models,
-    load_all_base_models,
+    get_trunk,
+    step_trunk,
+    save_trunk,
+    load_trunk,
     rnn_available,
-    _REGISTRY,
-    _REGISTRY_LOCK,
 )
+from worldsim.ai.rnn.unified import _BATCH_SIZE, _REPLAY, CORE_DIM, add_experience
 from worldsim.nations.civilian import (
     CivilianController,
     DEPARTMENTS,
@@ -116,10 +115,17 @@ class TestControllerTypes:
         for n in nations.values():
             assert isinstance(n.diplomacy_ai, TorchDiplomacyAI)
 
-    def test_research_ai_is_torch(self):
+    def test_research_subsystems_are_torch(self):
+        """physics/engineering/biology now run on the unified trunk too —
+        nation.research_ai (the old, never-actually-called Torch role) is
+        gone; the real research decisions live on tech_tree.subsystems."""
         nations = make_world()
         for n in nations.values():
-            assert isinstance(n.research_ai, TorchResearchAI)
+            assert not hasattr(n, "research_ai")
+            for sub in n.tech_tree.subsystems:
+                assert isinstance(sub.ai, TorchResearchSubsystemAI), (
+                    f"{n.name}'s {sub.name} subsystem is {type(sub.ai).__name__}"
+                )
 
     def test_doctrine_ai_is_torch(self):
         nations = make_world()
@@ -143,47 +149,42 @@ class TestControllerTypes:
                 assert n.civilian_ai.dept_models[dept.slug].n_outputs == dept.n_actions
             assert n.project_ai.n_outputs   == len(PROJECT_CATALOG)
             assert n.diplomacy_ai.n_outputs == 3
-            # research_ai.n_outputs == number of tech nodes at creation time
-            assert n.research_ai.n_outputs > 0
+            # each subsystem's n_outputs == number of tech nodes at creation time
+            for sub in n.tech_tree.subsystems:
+                assert sub.ai.n_outputs > 0
             assert n.doctrine_ai.n_outputs == 5
 
 
 # ---------------------------------------------------------------------------
-# 2. Base-model registry
+# 2. Shared trunk
 # ---------------------------------------------------------------------------
 
 class TestBaseModelRegistry:
-    def test_nations_share_civilian_base(self):
+    def test_nations_share_the_trunk(self):
+        """Unification means EVERY role, on every nation, shares one trunk."""
         nations = make_world()
         ns = list(nations.values())
-        assert civ_overseer(ns[0]).base is civ_overseer(ns[1]).base
-        assert civ_overseer(ns[1]).base is civ_overseer(ns[2]).base
-
-    def test_nations_share_war_base(self):
-        nations = make_world()
-        ns = list(nations.values())
-        assert ns[0].military_ai.base is ns[1].military_ai.base
-
-    def test_nations_share_doctrine_base(self):
-        nations = make_world()
-        ns = list(nations.values())
-        assert ns[0].doctrine_ai.base is ns[1].doctrine_ai.base
+        trunk = get_trunk()
+        assert civ_overseer(ns[0]).trunk is trunk
+        assert civ_overseer(ns[1]).trunk is trunk
+        assert ns[0].military_ai.trunk is trunk
+        assert ns[0].doctrine_ai.trunk is trunk
+        assert ns[1].diplomacy_ai.trunk is trunk
 
     def test_nations_have_independent_lora(self):
         """Each nation must own its own LoRA tensor objects."""
         nations = make_world()
         ns = list(nations.values())
-        # Different Python objects even though they share the base
-        assert civ_overseer(ns[0]).lora_B_out is not civ_overseer(ns[1]).lora_B_out
+        # Different Python objects even though they share the trunk
+        assert civ_overseer(ns[0]).lora_B_head is not civ_overseer(ns[1]).lora_B_head
+        assert ns[0]._unified_bank.lora_A_core is not ns[1]._unified_bank.lora_A_core
 
-    def test_registry_has_role_entries_after_init(self):
-        """At least the civilian and war keys should appear in the registry."""
+    def test_trunk_has_role_heads_after_init(self):
+        """At least the civilian_overseer and war heads should exist on the trunk."""
         make_world()
-        with _REGISTRY_LOCK:
-            keys = set(_REGISTRY.keys())
-        # Check by prefix (exact key includes n_inputs × n_outputs)
-        assert any(k.startswith("civilian_") for k in keys)
-        assert any(k.startswith("war_") for k in keys)
+        trunk = get_trunk()
+        assert "civilian_overseer" in trunk.heads
+        assert "war" in trunk.heads
 
 
 # ---------------------------------------------------------------------------
@@ -196,21 +197,14 @@ class TestProcessTurn:
         for n in nations.values():
             n.process_turn(nations)   # must not raise
 
-    def test_civilian_replay_grows_after_turn(self):
+    def test_shared_replay_grows_after_turn(self):
+        """Every role's train() call deposits into the one shared replay
+        buffer (tagged by role) that trains the unified trunk."""
         nations = make_world()
         ns = list(nations.values())
-        # Record baseline (may be non-zero from earlier tests in session)
-        baseline = len(civ_overseer(ns[0]).base._replay)
+        baseline = len(_REPLAY)
         ns[0].process_turn(nations)
-        # At least one experience added (the overseer trains every turn)
-        assert len(civ_overseer(ns[0]).base._replay) > baseline
-
-    def test_doctrine_replay_grows_after_turn(self):
-        nations = make_world()
-        ns = list(nations.values())
-        baseline = len(ns[0].doctrine_ai.base._replay)
-        ns[0].process_turn(nations)
-        assert len(ns[0].doctrine_ai.base._replay) > baseline
+        assert len(_REPLAY) > baseline
 
     def test_hidden_state_non_zero_after_turn(self):
         """The GRU hidden state should advance from zero after a real turn."""
@@ -224,26 +218,29 @@ class TestProcessTurn:
         assert math.isfinite(h_after_norm)
         assert h_after_norm >= 0.0
 
-    def test_lora_B_out_changes_after_turn(self):
-        """The civilian LoRA B matrix must change during a turn (TD(0) update)."""
+    def test_lora_B_head_changes_after_turn(self):
+        """The civilian head LoRA B matrix must change during a turn (TD(0) update)."""
         nations = make_world()
         n = list(nations.values())[0]
-        b_before = civ_overseer(n).lora_B_out.data.clone()
+        b_before = civ_overseer(n).lora_B_head.data.clone()
         n.process_turn(nations)
         n.process_turn(nations)   # second turn ensures gradient is non-trivial
-        b_after = civ_overseer(n).lora_B_out.data.clone()
+        b_after = civ_overseer(n).lora_B_head.data.clone()
         assert not torch.allclose(b_before, b_after), (
-            "civilian LoRA B_out did not change after two simulation turns"
+            "civilian head LoRA B did not change after two simulation turns"
         )
 
     def test_lora_values_stay_finite(self):
-        """No NaN or Inf should appear in any LoRA tensor after 5 turns."""
+        """No NaN or Inf should appear in any LoRA tensor (core or head) after 5 turns."""
         nations = make_world()
         n = list(nations.values())[0]
         for _ in range(5):
             n.process_turn(nations)
-        for attr in ("lora_A_in", "lora_B_in", "lora_A_out", "lora_B_out"):
+        for attr in ("lora_A_head", "lora_B_head"):
             t = getattr(civ_overseer(n), attr)
+            assert torch.all(torch.isfinite(t)), f"{attr} contains NaN/Inf"
+        for attr in ("lora_A_core", "lora_B_core"):
+            t = getattr(n._unified_bank, attr)
             assert torch.all(torch.isfinite(t)), f"{attr} contains NaN/Inf"
 
 
@@ -289,44 +286,45 @@ class TestTemporalContext:
 
 
 # ---------------------------------------------------------------------------
-# 5. Base-model update (step_all_base_models)
+# 5. Shared trunk update (step_trunk)
 # ---------------------------------------------------------------------------
 
 class TestBaseModelUpdate:
-    def test_step_all_base_models_no_crash(self):
-        """step_all_base_models must not raise regardless of replay state."""
-        step_all_base_models(n_steps=1)
+    def test_step_trunk_no_crash(self):
+        """step_trunk must not raise regardless of replay state."""
+        step_trunk(n_steps=1)
 
-    def test_base_model_updated_after_full_replay(self):
-        """Run enough turns to fill the civilian replay buffer, then verify
-        that step_all_base_models actually changes the base model weights."""
+    def test_trunk_updated_after_full_replay(self):
+        """Run enough turns to fill the shared replay buffer, then verify
+        that step_trunk actually changes the trunk's civilian head weights."""
         nations = make_world()
-        civilian_base = civ_overseer(list(nations.values())[0]).base
+        trunk = get_trunk()
 
         # Fill the replay buffer beyond the batch size
-        n_turns = RoleBaseModel._BATCH_SIZE + 5
+        n_turns = _BATCH_SIZE + 5
         for _ in range(n_turns):
             for n in nations.values():
                 n.process_turn(nations)
 
-        w_before = civilian_base.model.output_proj.weight.data.clone()
-        civilian_base.update_base(n_steps=2)
-        w_after  = civilian_base.model.output_proj.weight.data.clone()
+        w_before = trunk.heads["civilian_overseer"].weight.data.clone()
+        step_trunk(n_steps=2)
+        w_after  = trunk.heads["civilian_overseer"].weight.data.clone()
 
         assert not torch.allclose(w_before, w_after), (
-            "Base model weights unchanged after update_base with full replay"
+            "Trunk civilian_overseer head weights unchanged after step_trunk with full replay"
         )
 
-    def test_base_weights_finite_after_update(self):
-        """No NaN or Inf should appear in base model weights after training."""
+    def test_trunk_weights_finite_after_update(self):
+        """No NaN or Inf should appear in trunk weights after training."""
         nations = make_world()
-        civilian_base = civ_overseer(list(nations.values())[0]).base
-        buf = [[0.1] * civilian_base.model.input_dim] * 5
-        for i in range(RoleBaseModel._BATCH_SIZE + 1):
-            civilian_base.add_experience((buf, i % 3, 1.0, buf))
-        civilian_base.update_base(n_steps=2)
-        for p in civilian_base.model.parameters():
-            assert torch.all(torch.isfinite(p.data)), "NaN/Inf in base model"
+        n = list(nations.values())[0]
+        extra_dim = civ_overseer(n).n_inputs
+        buf = [[0.1] * (CORE_DIM + extra_dim)] * 5
+        for i in range(_BATCH_SIZE + 1):
+            add_experience(("civilian_overseer", buf, i % 3, 1.0, buf))
+        step_trunk(n_steps=2)
+        for p in get_trunk().parameters():
+            assert torch.all(torch.isfinite(p.data)), "NaN/Inf in trunk"
 
 
 # ---------------------------------------------------------------------------
@@ -342,15 +340,14 @@ class TestSimulationLoop:
         loop.step()   # one full century (5 fifths)
 
     def test_simulation_loop_calls_rnn_step(self):
-        """step_all_base_models is called by SimulationLoop — verify that
-        the replay buffer grows during a full century."""
+        """step_trunk is called by SimulationLoop — verify that the shared
+        replay buffer grows during a full century."""
         from worldsim.engine import SimulationLoop
         nations = make_world()
-        civilian_base = civ_overseer(list(nations.values())[0]).base
-        baseline = len(civilian_base._replay)
+        baseline = len(_REPLAY)
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
-        assert len(civilian_base._replay) > baseline, (
+        assert len(_REPLAY) > baseline, (
             "Replay buffer did not grow during SimulationLoop.step()"
         )
 
@@ -367,10 +364,10 @@ class TestSimulationLoop:
         from worldsim.engine import SimulationLoop
         nations = make_world()
         n = list(nations.values())[0]
-        b_before = civ_overseer(n).lora_B_out.data.clone()
+        b_before = civ_overseer(n).lora_B_head.data.clone()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
-        b_after = civ_overseer(n).lora_B_out.data.clone()
+        b_after = civ_overseer(n).lora_B_head.data.clone()
         assert not torch.allclose(b_before, b_after)
 
 
@@ -387,26 +384,43 @@ class TestPersistence:
             n.process_turn(nations)   # ensure some replay data exists
         merge_and_save_models(nations, tmp_path)  # must not raise
 
-    def test_torch_bases_dir_created(self, tmp_path):
-        """merge_and_save_models should create a torch_bases/ subdirectory."""
+    def test_torch_trunk_file_created(self, tmp_path):
+        """merge_and_save_models should write a single torch_trunk.pt checkpoint
+        (one shared trunk now, not a directory of per-role base models)."""
         from worldsim.ai.persistence import merge_and_save_models
         nations = make_world()
         for n in nations.values():
             n.process_turn(nations)
         merge_and_save_models(nations, tmp_path)
-        assert (tmp_path / "torch_bases").exists(), (
-            "torch_bases/ directory not created by merge_and_save_models"
+        assert (tmp_path / "torch_trunk.pt").exists(), (
+            "torch_trunk.pt not created by merge_and_save_models"
         )
 
-    def test_torch_base_files_written(self, tmp_path):
-        """At least one .pt base-model file should exist after saving."""
+    def test_merge_and_save_models_clears_replay_buffers(self, tmp_path):
+        """merge_and_save_models must wipe the shared replay buffers (training
+        scratch space, not learned state) before writing a checkpoint."""
         from worldsim.ai.persistence import merge_and_save_models
+        from worldsim.ai.rnn.divisions import _REPLAY as DIVISION_REPLAY
+
         nations = make_world()
         for n in nations.values():
             n.process_turn(nations)
+        assert len(_REPLAY) > 0, "expected some replay data before saving"
         merge_and_save_models(nations, tmp_path)
-        pt_files = list((tmp_path / "torch_bases").glob("*.pt"))
-        assert len(pt_files) > 0, "No .pt files written to torch_bases/"
+        assert len(_REPLAY) == 0
+        assert len(DIVISION_REPLAY) == 0
+
+    def test_merge_and_save_models_resets_hidden_state(self, tmp_path):
+        """merge_and_save_models must reset every role view's transient GRU
+        hidden state so a loaded nation doesn't resume mid-context."""
+        from worldsim.ai.persistence import merge_and_save_models
+
+        nations = make_world()
+        n = list(nations.values())[0]
+        view = civ_overseer(n)
+        view._h = torch.ones(1, 1, view._h.shape[-1])
+        merge_and_save_models(nations, tmp_path)
+        assert torch.all(view._h == 0), "hidden state not reset before save"
 
     def test_ga_seed_written(self, tmp_path):
         """seed_ga.json must always be written."""
@@ -427,37 +441,35 @@ class TestPersistence:
         result = load_model_seeds(nations2, tmp_path)
         assert result is True
 
-    def test_base_weights_restored_after_load(self, tmp_path):
-        """Base model weights saved in one run must be restored in the next."""
+    def test_trunk_weights_restored_after_load(self, tmp_path):
+        """Trunk weights saved in one run must be restored in the next.
+
+        The trunk is a process-wide singleton, so ``reset_trunk()`` forces a
+        brand new (freshly random-initialised) instance in between — the
+        stand-in for "a fresh process loading a previous run's seed".
+        """
         from worldsim.ai.persistence import merge_and_save_models, load_model_seeds
+        from worldsim.ai.rnn.unified import reset_trunk
 
         nations = make_world()
-        civ_base = civ_overseer(list(nations.values())[0]).base
-
-        # Train the base model a bit
-        buf = [[0.2] * civ_base.model.input_dim] * 5
-        for i in range(RoleBaseModel._BATCH_SIZE + 1):
-            civ_base.add_experience((buf, i % 3, 1.0, buf))
-        civ_base.update_base(n_steps=2)
-        w_trained = civ_base.model.output_proj.weight.data.clone()
+        n = list(nations.values())[0]
+        extra_dim = civ_overseer(n).n_inputs
+        buf = [[0.2] * (CORE_DIM + extra_dim)] * 5
+        for i in range(_BATCH_SIZE + 1):
+            add_experience(("civilian_overseer", buf, i % 3, 1.0, buf))
+        step_trunk(n_steps=2)
+        w_trained = get_trunk().heads["civilian_overseer"].weight.data.clone()
 
         merge_and_save_models(nations, tmp_path)
 
-        # Create a fresh world with untrained base models
+        reset_trunk()
         nations2 = make_world()
-        civ_base2 = civ_overseer(list(nations2.values())[0]).base
-
-        # The fresh base may have different random init — corrupt to zeros
-        with torch.no_grad():
-            civ_base2.model.output_proj.weight.zero_()
-
         load_model_seeds(nations2, tmp_path)
 
-        # After loading the trained weights should be restored
         assert torch.allclose(
-            civ_base2.model.output_proj.weight,
+            get_trunk().heads["civilian_overseer"].weight.data,
             w_trained,
-        ), "Base model weights not restored after save/load cycle"
+        ), "Trunk weights not restored after save/load cycle"
 
     def test_lora_save_load_per_nation(self, tmp_path):
         """save_table / load_table must preserve per-nation LoRA weights."""
@@ -466,7 +478,7 @@ class TestPersistence:
         # Train a few turns to diverge LoRA from zero
         for _ in range(3):
             n.process_turn(nations)
-        b_out_saved = civ_overseer(n).lora_B_out.data.clone()
+        b_head_saved = civ_overseer(n).lora_B_head.data.clone()
 
         # The controller derives per-sub-model paths from this base path.
         lora_path = tmp_path / "civ_lora.yml"
@@ -476,13 +488,13 @@ class TestPersistence:
         nations2 = make_world()
         n2 = list(nations2.values())[0]
         with torch.no_grad():
-            civ_overseer(n2).lora_B_out.zero_()
+            civ_overseer(n2).lora_B_head.zero_()
         n2.civilian_ai.load_table(lora_path)
 
         assert torch.allclose(
-            civ_overseer(n2).lora_B_out,
-            b_out_saved,
-        ), "Per-nation LoRA B_out not restored after save_table/load_table"
+            civ_overseer(n2).lora_B_head,
+            b_head_saved,
+        ), "Per-nation head LoRA B not restored after save_table/load_table"
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +623,8 @@ class TestFleetControllerIntegration:
         fc.predict(s)
         fc.train(s, 0, 0.5, [0.2] * 15)
 
-    def test_fleet_shares_base_with_nation_fleets(self):
-        """All fleet controllers in one run share the 'fleet' base model."""
+    def test_fleet_shares_trunk_with_nation_fleets(self):
+        """All fleet controllers (and every other role) share the one trunk."""
         from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
@@ -625,53 +637,35 @@ class TestFleetControllerIntegration:
             if isinstance(f.controller, TorchFleetController)
         ]
         if len(fcs) >= 2:
-            assert fcs[0].base is fcs[1].base, (
-                "Fleet controllers in the same run don't share a base model"
+            assert fcs[0].trunk is fcs[1].trunk is get_trunk(), (
+                "Fleet controllers in the same run don't share the trunk"
             )
 
 
 # ---------------------------------------------------------------------------
-# 10. MetaGA ⇔ LoRA integration
+# 10. Reward function / LoRA evolution
 # ---------------------------------------------------------------------------
 
-class TestMetaGAIntegration:
+class TestRewardAndLoRAEvolution:
     def test_goal_progress_bonus_in_compute_reward(self):
         """compute_reward must return a slightly higher value when active goals
         have positive progress vs a nation with no active goals."""
         nations = make_world()
         n = list(nations.values())[0]
 
-        state     = [0.5] * 20
-        new_state = [0.5] * 20   # identical state → zero base reward
+        snapshot = n.reward_snapshot()   # identical before/after → zero base reward
 
-        r_with_goals    = n.compute_reward("civilian", state, new_state)
+        r_with_goals    = n.compute_reward(snapshot, snapshot)
         # Clear goals and compute again
         n.goals.goals.clear()
-        r_without_goals = n.compute_reward("civilian", state, new_state)
+        r_without_goals = n.compute_reward(snapshot, snapshot)
 
         # With goals present, progress() ≥0 and goal_bonus ≥0, so reward ≥
         assert r_with_goals >= r_without_goals
 
-    def test_epsilon_decreases_after_positive_century_score(self):
-        """After running a century where the nation scores positively, the
-        SimulationLoop.step() call should lower epsilon via sync_all_meta_ga."""
-        from worldsim.engine import SimulationLoop
-        nations = make_world()
-        n = list(nations.values())[0]
-        eps_before = civ_overseer(n).epsilon
-
-        # Give the nation a stable start so it receives a positive score
-        n.stability = 80.0
-        loop = SimulationLoop(nations, log_path=None)
-        loop.step()
-
-        # epsilon should have changed (possibly decreased for positive-scoring
-        # nations, or stayed at base for zero-fitness genomes)
-        # We just verify it's within valid range and is finite
-        assert 0.0 <= civ_overseer(n).epsilon <= 1.0
-
     def test_evolve_meta_mutates_lora(self):
-        """evolve_meta() must apply Gaussian noise to all RNN controller LoRAs."""
+        """evolve_meta() must apply Gaussian noise to every role's head LoRA
+        and the nation's shared core LoRA."""
         nations = make_world()
         n = list(nations.values())[0]
 
@@ -680,58 +674,38 @@ class TestMetaGAIntegration:
         for _ in range(3):
             n.process_turn(nations)
 
-        b_before = civ_overseer(n).lora_B_out.data.clone()
+        b_before = civ_overseer(n).lora_B_head.data.clone()
+        core_b_before = n._unified_bank.lora_B_core.data.clone()
         n.evolve_meta()
-        b_after  = civ_overseer(n).lora_B_out.data.clone()
+        b_after  = civ_overseer(n).lora_B_head.data.clone()
+        core_b_after = n._unified_bank.lora_B_core.data.clone()
 
         # With sigma=0.02 and a non-trivial tensor, the tensors should differ
         # (statistically impossible for all elements to hit exactly zero noise)
         assert not torch.allclose(b_before, b_after), (
-            "evolve_meta() did not mutate lora_B_out"
+            "evolve_meta() did not mutate the civilian_overseer head LoRA"
+        )
+        assert not torch.allclose(core_b_before, core_b_after), (
+            "evolve_meta() did not mutate the nation's core LoRA"
         )
 
     def test_evolve_meta_resets_optimizer_momentum(self):
-        """After evolve_meta(), the Adam optimizer must have empty state."""
+        """After evolve_meta(), the Adam optimizers must have empty state."""
         nations = make_world()
         n = list(nations.values())[0]
         # Train to accumulate Adam state
         for _ in range(5):
             n.process_turn(nations)
-        old_state_len = len(civ_overseer(n)._lora_optimizer.state)
+        old_state_len = len(civ_overseer(n)._head_optimizer.state)
         n.evolve_meta()
         # After reset, Adam state should be empty
-        assert len(civ_overseer(n)._lora_optimizer.state) == 0, (
-            f"Optimizer state not cleared after evolve_meta; "
+        assert len(civ_overseer(n)._head_optimizer.state) == 0, (
+            f"Head optimizer state not cleared after evolve_meta; "
             f"had {old_state_len} entries before reset"
         )
-
-    def test_reward_scale_influences_replay_values(self):
-        """A nation with positive GA fitness should store scaled rewards."""
-        from worldsim.ai.meta_ga import RewardGA
-        nations = make_world()
-        n = list(nations.values())[0]
-
-        # Manually boost fitness and sync
-        for ga in n.reward_ga.values():
-            ga.population[ga.active].fitness = 200.0
-        from worldsim.ai.rnn import sync_all_meta_ga
-        sync_all_meta_ga(nations)
-
-        assert civ_overseer(n)._reward_scale > 1.0, (
-            "reward_scale not increased after positive fitness sync"
+        assert len(n._unified_bank._core_optimizer.state) == 0, (
+            "Core optimizer state not cleared after evolve_meta"
         )
-
-    def test_sync_all_meta_ga_called_in_simulation_loop(self):
-        """SimulationLoop.step() must update epsilon for all controllers.
-        Run two centuries and verify epsilon is in valid range."""
-        from worldsim.engine import SimulationLoop
-        nations = make_world()
-        loop = SimulationLoop(nations, log_path=None)
-        loop.step()
-        loop.step()
-        for n in nations.values():
-            assert 0.0 <= civ_overseer(n).epsilon <= 1.0
-            assert 0.5 <= civ_overseer(n)._reward_scale <= 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -752,16 +726,15 @@ class TestNumericalHealth:
                 f"Non-finite score in nation {n.name} civilian AI"
             )
 
-    def test_no_nan_in_base_model_params_after_century(self):
-        """Base model parameters must remain finite after a simulation century."""
+    def test_no_nan_in_trunk_params_after_century(self):
+        """Trunk parameters must remain finite after a simulation century."""
         from worldsim.engine import SimulationLoop
         nations = make_world()
         loop = SimulationLoop(nations, log_path=None)
         loop.step()
-        civ_base = civ_overseer(list(nations.values())[0]).base
-        for p in civ_base.model.parameters():
+        for p in get_trunk().parameters():
             assert torch.all(torch.isfinite(p.data)), (
-                "NaN/Inf in civilian base model after one century"
+                "NaN/Inf in shared trunk after one century"
             )
 
 

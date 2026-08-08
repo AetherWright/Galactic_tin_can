@@ -54,7 +54,7 @@ class ResearchDirector:
         # Lock in the base graphs (incl. injected FTL nodes) and build AIs.
         for sub in self.subsystems:
             sub.finalize_bases()
-            sub.attach_ai()
+            sub.attach_ai(nation)
 
         #: Director-level allocation policy.
         # # TODO: Aether — director allocation strategy.  Optionally drive this
@@ -91,15 +91,8 @@ class ResearchDirector:
         return out
 
     # -- allocation --------------------------------------------------------
-    def research(
-        self, points: float, nation: "Nation", ai: Optional["ResearchAI"] = None
-    ) -> None:
-        """Allocate ``points`` across the subsystems and run their research.
-
-        ``ai`` is accepted for signature compatibility with the old
-        ``TechnologyTree.research`` call (``nation.research_ai``) but is not
-        used for allocation by default — see the ``allocation_ai`` TODO.
-        """
+    def research(self, points: float, nation: "Nation") -> None:
+        """Allocate ``points`` across the subsystems and run their research."""
         self.total_points += points
         if points <= 0:
             return

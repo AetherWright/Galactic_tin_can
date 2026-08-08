@@ -244,16 +244,6 @@ class CivilianController:
             self.load_table(self._base_path)
 
     # ------------------------------------------------------------------
-    # MetaGA integration
-    # ------------------------------------------------------------------
-
-    def sync_meta_ga(self, ga: object) -> None:
-        """Propagate MetaGA fitness state to the overseer and every dept model."""
-        for m in (self.overseer, *self.dept_models.values()):
-            if hasattr(m, "sync_meta_ga"):
-                m.sync_meta_ga(ga)
-
-    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -487,11 +477,12 @@ def _apply_hierarchical_civilian_ai(nation: "Nation", ctrl: CivilianController) 
         if first:
             nation.last_civilian_action = global_idx
             first = False
+        reward_before = nation.reward_snapshot()
         _execute_civilian_action(nation, global_idx)
         spent += weight
 
         ns     = _civilian_state(nation)
-        reward = nation.compute_reward("civilian", s, ns)
+        reward = nation.compute_reward(reward_before, nation.reward_snapshot())
         dept_model.train(s, local_idx, reward, ns)
         dept_rewards[dept_idx] = reward
 
@@ -518,9 +509,10 @@ def _apply_civilian_ai(nation: "Nation") -> None:
     valid_mask = _valid_action_mask(nation)
     idx        = ctrl.choose_action(state, valid_mask)
     nation.last_civilian_action = idx
+    reward_before = nation.reward_snapshot()
     _execute_civilian_action(nation, idx)
     new_state  = _civilian_state(nation)
-    reward     = nation.compute_reward("civilian", state, new_state)
+    reward     = nation.compute_reward(reward_before, nation.reward_snapshot())
     ctrl.train(state, idx, reward, new_state)
 
 
@@ -534,9 +526,10 @@ def process_action_queue(nation: "Nation", limit: int = 2) -> None:
     while nation.action_queue and processed < limit:
         idx       = nation.action_queue.pop(0)
         state     = _civilian_state(nation)
+        reward_before = nation.reward_snapshot()
         _execute_civilian_action(nation, idx)
         new_state = _civilian_state(nation)
-        reward    = nation.compute_reward("civilian", state, new_state)
+        reward    = nation.compute_reward(reward_before, nation.reward_snapshot())
         if isinstance(ctrl, CivilianController):
             ctrl.train_on_global_action(state, idx, reward, new_state)
         else:
@@ -582,9 +575,10 @@ def _random_civilian_actions(
             state      = _civilian_state(nation)
             valid_mask = _valid_action_mask(nation)
             idx        = nation.civilian_ai.choose_action(state, valid_mask)
+            reward_before = nation.reward_snapshot()
             _execute_civilian_action(nation, idx)
             new_state  = _civilian_state(nation)
-            reward     = nation.compute_reward("civilian", state, new_state)
+            reward     = nation.compute_reward(reward_before, nation.reward_snapshot())
             nation.civilian_ai.train(state, idx, reward, new_state)
         return
 
