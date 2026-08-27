@@ -228,7 +228,7 @@ def make_fleet_controller() -> LayeredNetworkFleetController:
     try:
         from ..ai.rnn import TorchFleetController
         if TorchFleetController is not None:
-            return TorchFleetController()  # type: ignore[return-value]
+            return TorchFleetController(n_outputs=_FLEET_CTRL_N_OUTPUTS)  # type: ignore[return-value]
     except (ImportError, AttributeError):
         pass
     return LayeredNetworkFleetController()
