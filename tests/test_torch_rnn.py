@@ -142,8 +142,7 @@ class TestAvailability:
         assert len(_DOCTRINE_LIST) == 5
 
     def test_fleet_state_list_length(self):
-        assert len(_FLEET_STATE_LIST) == 7
-
+        assert len(scores) == len(FLEET_STATE_LIST)
 
 # ===========================================================================
 # 2. UnifiedTrunkModel
